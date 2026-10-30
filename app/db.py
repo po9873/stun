@@ -100,9 +100,13 @@ def init():
 # ---------------- mappings ----------------
 
 def list_mappings():
+    """按爱快规则 ID 排序，和路由上的顺序保持一致；
+    还没拿到规则 ID 的新映射排最后。"""
     with _lock:
         c = _conn()
-        rows = c.execute("SELECT * FROM mappings ORDER BY id").fetchall()
+        rows = c.execute(
+            "SELECT * FROM mappings ORDER BY IFNULL(rule_id, 2147483647), id"
+        ).fetchall()
         c.close()
         return [dict(r) for r in rows]
 

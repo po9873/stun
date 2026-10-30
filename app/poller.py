@@ -12,7 +12,7 @@ import logging
 import threading
 import time
 
-from . import config, db, ikuai_client, stun_probe, state
+from . import config, db, ikuai_client, notifier, stun_probe, state
 
 log = logging.getLogger("stun.poller")
 
@@ -96,6 +96,10 @@ def _poll_mappings(client):
             log.info(f"公网端口变化 [{m['name']}] {m.get('public_port')} -> {ext_port}"
                      f" ({'精确' if exact else '近似'})")
             db.update_mapping(m["id"], public_port=ext_port)
+            # 公网端口变了才通知（这才是别人访问你需要的地址）
+            if exact:
+                notifier.public_port_changed(
+                    m, m.get("public_port"), ext_port, state.get()["external_ip"])
         # 记录这次探测是不是真的绑到了目标内网 IP。跨 IP 探测（目标机不是容器自己）
         # 时 CGNAT 给的公网端口可能不同，页面上要能区分，不能给出假精度。
         if bool(exact) != bool(m.get("public_exact", 1)):
@@ -240,9 +244,11 @@ def _reconcile(client):
             client.update_dnat(rid, {"wan_port": want}, fallback=fallback)
             fixed += 1
             log.info(f"对账修正 [{m['name']}] 爱快外网端口 {router[rid]} -> {want}")
+            notifier.reconciled(m["name"], router[rid], want)
             router[rid] = want
         except Exception as e:
             log.error(f"对账修正失败 [{m['name']}]: {e}")
+            notifier.rule_failed(m["name"], f"对账修正失败：{e}")
     if fixed:
         log.info(f"对账完成，修正 {fixed} 条规则")
         state.set(router_wan_ports={str(k): v for k, v in router.items()})

@@ -98,6 +98,32 @@
     </div>
 
     <div class="card">
+      <h3>批量录入（从 Lucky / 爱快粘贴）</h3>
+      <p class="muted" style="margin:0 0 10px">
+        直接在 Lucky 后台或爱快「穿透规则」页选中复制，粘进来即可。
+        每行一条，支持 <code>名称 IP 端口 协议</code> 和 <code>IP:端口</code> 连写，
+        也认爱快那种 <code>UDP4 :39213 EasyTier-udp — — 192.168.6.42:27834</code> 的整行格式。
+      </p>
+      <textarea id="bulk_text" rows="5" placeholder="EasyTier-udp 192.168.6.42:27834 udp
+QB-RSS 192.168.6.13 46065 tcp+udp
+TR-保种, 192.168.6.251, 24211, tcp+udp"
+        style="width:100%;background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+               padding:9px;border-radius:7px;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px"></textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn primary" onclick="bulkAdd()">解析并录入</button>
+        <label style="display:flex;gap:6px;align-items:center;color:var(--muted);font-size:13px">
+          <input type="checkbox" id="bulk_rule" checked style="width:auto"/> 同时在爱快创建 DNAT 规则
+        </label>
+        <span id="bulk_msg" class="muted"></span>
+      </div>
+      <p class="muted" style="margin:10px 0 0">
+        行里的公网端口（如 <code>:39213</code>）会被<b>丢弃</b>：CGNAT 下爱快 DNAT 的外网端口
+        必须等于内网端口，把公网端口填进去规则就匹配不上了。
+        公网访问地址会在录入后由 STUN 自己测出来。
+      </p>
+    </div>
+
+    <div class="card">
       <h3>从爱快导入已有规则</h3>
       <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn primary" onclick="discover()">扫描爱快上的规则</button>
@@ -223,6 +249,62 @@
         <b>端口保留</b>：外网端口等于内网端口，公网端口只在页面展示。
         适用于改端口的是爱快本身的情况。
       </p>
+    </div>
+
+    <div class="card">
+      <h3>变更通知（Webhook）</h3>
+      <p class="muted" style="margin:0 0 12px">
+        公网端口一变就推送给你 —— 这就是 Lucky 里「STUN 穿透 + Webhook 推送」那套。
+      </p>
+      <div class="form">
+        <div><label>启用通知</label>
+          <select id="nf_on"><option value="0">关</option><option value="1">开</option></select>
+        </div>
+        <div><label>推送平台</label>
+          <select id="nf_kind">
+            <option value="custom">自定义 URL（POST JSON）</option>
+            <option value="dingtalk">钉钉机器人</option>
+            <option value="wecom">企业微信机器人</option>
+            <option value="feishu">飞书机器人</option>
+            <option value="bark">Bark（iOS）</option>
+          </select>
+        </div>
+        <div style="grid-column:1/-1">
+          <label>推送地址</label>
+          <input id="nf_url" placeholder="https://oapi.dingtalk.com/robot/send?access_token=xxxx"/>
+        </div>
+        <div><label>同一映射最小间隔(秒)</label>
+          <input id="nf_gap" type="number" placeholder="600"/>
+        </div>
+      </div>
+      <div class="form" style="margin-top:12px">
+        <div style="grid-column:1/-1">
+          <label>推送哪些事件</label>
+          <div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px">
+            <label style="display:flex;gap:6px;align-items:center;color:var(--txt);font-size:13px">
+              <input type="checkbox" id="nf_e_port" style="width:auto"/> 公网端口变化
+            </label>
+            <label style="display:flex;gap:6px;align-items:center;color:var(--txt);font-size:13px">
+              <input type="checkbox" id="nf_e_mapping" style="width:auto"/> 映射增删
+            </label>
+            <label style="display:flex;gap:6px;align-items:center;color:var(--txt);font-size:13px">
+              <input type="checkbox" id="nf_e_reconcile" style="width:auto"/> 对账修正
+            </label>
+            <label style="display:flex;gap:6px;align-items:center;color:var(--txt);font-size:13px">
+              <input type="checkbox" id="nf_e_error" style="width:auto"/> 爱快操作失败
+            </label>
+          </div>
+        </div>
+      </div>
+      <p class="muted" style="margin:10px 0 0">
+        CGNAT 的公网端口会自己漂移（实测同一端口隔 75 秒就换一个），
+        所以「公网端口变化」必须带冷却，否则一条映射就能把手机刷爆。
+        默认同一映射 10 分钟内只推一次。
+      </p>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn primary" onclick="testNotify()">发送测试</button>
+        <span id="nf_msg" class="muted"></span>
+      </div>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn primary" onclick="saveSettings()">保存并试连</button>
         <button class="btn" onclick="loadSettings()">重新载入</button>
@@ -280,7 +362,9 @@ async function loadStatus(){
 let EXT_IP = null;
 let ROUTER = {};
 async function loadMappings(){
-  const rows = await (await fetch("/api/mappings")).json();
+  // 按爱快规则 ID 排序，和路由上的顺序对得上；还没拿到规则 ID 的新映射排最后
+  const rows = (await (await fetch("/api/mappings")).json())
+    .sort((a,b)=>(a.rule_id||999999)-(b.rule_id||999999));
   const tb = $("map_body"); tb.innerHTML="";
   rows.forEach(m=>{
     const tr = document.createElement("tr");
@@ -354,6 +438,25 @@ async function del(id, name){
 }
 async function resume(id){ await fetch("/api/mappings/"+id+"/resume",{method:"POST"}); refresh(); }
 async function reconcile(){ await fetch("/api/mappings/reconcile",{method:"POST"}); refresh(); }
+
+/* ---------------- 批量录入 ---------------- */
+async function bulkAdd(){
+  const el = $("bulk_msg");
+  const text = $("bulk_text").value;
+  if(!text.trim()){ alert("先粘贴规则文本"); return; }
+  el.style.color = "var(--muted)"; el.textContent = "解析中…";
+  const j = await (await fetch("/api/mappings/bulk",{method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({text, create_rules:$("bulk_rule").checked})}).then(r=>r.json()));
+  const n = j.created.length;
+  el.style.color = n ? "var(--green)" : "var(--red)";
+  let msg = `录入 ${n} 条`;
+  if(j.skipped.length) msg += `，跳过 ${j.skipped.length} 条`;
+  if(j.unparsed.length) msg += `，无法识别 ${j.unparsed.length} 行：${j.unparsed.join(" / ")}`;
+  el.textContent = msg;
+  $("bulk_text").value = "";
+  refresh();
+}
 
 /* ---------------- 从爱快发现 / 接管 ---------------- */
 let DISCOVERED = [];
@@ -463,9 +566,44 @@ async function loadSettings(){
   $("set_ssl").value = s.ikuai_verify_ssl ? "1" : "0";
   $("set_mode").value = s.wan_port_mode || "preserve";
   $("set_pool").value = s.stun_pool_url || "";
+  $("nf_on").value = s.notify_enabled ? "1" : "0";
+  $("nf_kind").value = s.notify_kind || "custom";
+  $("nf_url").value = s.notify_url || "";
+  $("nf_gap").value = s.notify_min_gap || "600";
+  const on = (s.notify_on || "port,mapping,reconcile").split(",");
+  $("nf_e_port").checked = on.includes("port");
+  $("nf_e_mapping").checked = on.includes("mapping");
+  $("nf_e_reconcile").checked = on.includes("reconcile");
+  $("nf_e_error").checked = on.includes("error");
   $("set_state").innerHTML =
     `令牌：<b>${s.ikuai_token_set ? "已设置" : "未设置"}</b> ｜ ` +
     `实际调用基址：<b>${s.ikuai_api_base || "—"}</b>`;
+}
+function notifyOn(){
+  const k = ["port","mapping","reconcile","error"];
+  const id = {port:"nf_e_port",mapping:"nf_e_mapping",reconcile:"nf_e_reconcile",error:"nf_e_error"};
+  return k.filter(x=>$(id[x]).checked).join(",");
+}
+async function testNotify(){
+  const el = $("nf_msg");
+  el.style.color = "var(--muted)"; el.textContent = "正在发送…";
+  // 先把当前表单值存下来再测，否则测的是旧地址
+  await fetch("/api/settings",{method:"PUT",headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      ikuai_base_url:$("set_url").value.trim(),
+      ikuai_interface:$("set_iface").value.trim(),
+      ikuai_verify_ssl:$("set_ssl").value==="1",
+      wan_port_mode:$("set_mode").value,
+      stun_pool_url:$("set_pool").value.trim(),
+      notify_enabled:$("nf_on").value==="1",
+      notify_kind:$("nf_kind").value,
+      notify_url:$("nf_url").value.trim(),
+      notify_min_gap:$("nf_gap").value.trim(),
+      notify_on:notifyOn()
+    })});
+  const j = await (await fetch("/api/notify/test",{method:"POST"})).json();
+  el.style.color = j.ok ? "var(--green)" : "var(--red)";
+  el.textContent = (j.ok ? "✓ " : "✗ ") + j.message;
 }
 async function saveSettings(){
   const body = {
@@ -474,7 +612,12 @@ async function saveSettings(){
     ikuai_interface: $("set_iface").value.trim(),
     ikuai_verify_ssl: $("set_ssl").value === "1",
     wan_port_mode: $("set_mode").value,
-    stun_pool_url: $("set_pool").value.trim()
+    stun_pool_url: $("set_pool").value.trim(),
+    notify_enabled: $("nf_on").value === "1",
+    notify_kind: $("nf_kind").value,
+    notify_url: $("nf_url").value.trim(),
+    notify_min_gap: $("nf_gap").value.trim(),
+    notify_on: notifyOn()
   };
   const r = await fetch("/api/settings/test",{
     method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});

@@ -3,6 +3,7 @@
 启动钩子：初始化数据库、种入预置 STUN 服务器、启动后台轮询线程。
 """
 import logging
+import re
 import socket
 import threading
 from pathlib import Path
@@ -12,7 +13,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from . import config, db, ikuai_client, logbuf, poller, settings, state, stun_probe
+from . import (config, db, ikuai_client, logbuf, notifier, poller, settings,
+               state, stun_probe)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("stun")
@@ -42,6 +44,12 @@ class ImportIn(BaseModel):
     ids: list = []          # 要接管的爱快规则 ID
 
 
+class BulkIn(BaseModel):
+    """批量录入：直接粘贴从爱快「穿透规则」页 / Lucky 界面复制出来的多行文本。"""
+    text: str = ""
+    create_rules: bool = True
+
+
 class SettingsIn(BaseModel):
     ikuai_base_url: Optional[str] = None
     ikuai_token: Optional[str] = None      # 留空 = 沿用已保存的令牌
@@ -49,6 +57,11 @@ class SettingsIn(BaseModel):
     ikuai_verify_ssl: Optional[bool] = None
     wan_port_mode: Optional[str] = None    # stun | preserve
     stun_pool_url: Optional[str] = None
+    notify_enabled: Optional[bool] = None
+    notify_kind: Optional[str] = None      # custom/dingtalk/wecom/feishu/bark
+    notify_url: Optional[str] = None
+    notify_min_gap: Optional[str] = None
+    notify_on: Optional[str] = None        # port,mapping,reconcile,error
 
 
 def local_ips():
@@ -138,9 +151,26 @@ def api_put_settings(req: SettingsIn):
         data["wan_port_mode"] = req.wan_port_mode
     if req.stun_pool_url is not None:
         data["stun_pool_url"] = req.stun_pool_url
+    if req.notify_enabled is not None:
+        data["notify_enabled"] = "true" if req.notify_enabled else "false"
+    for k in ("notify_kind", "notify_min_gap", "notify_on"):
+        v = getattr(req, k)
+        if v is not None:
+            data[k] = v
     settings.set_values(data)
-    log.info(f"设置已保存（外网端口模式={settings.get('wan_port_mode')}）")
+    # 推送地址允许被清空（其余设置项留空表示「不变」，这里反过来）
+    if req.notify_url is not None:
+        db.set_setting("notify_url", req.notify_url.strip())
+    log.info(f"设置已保存（外网端口模式={settings.get('wan_port_mode')}，"
+             f"通知={'开' if settings.get_bool('notify_enabled') else '关'}）")
     return settings.public_view()
+
+
+@app.post("/api/notify/test")
+def api_notify_test():
+    """设置页「发送测试」：立即推一条，用于验证地址与平台格式对不对。"""
+    ok, msg = notifier.test()
+    return {"ok": ok, "message": msg}
 
 
 @app.post("/api/settings/test")
@@ -159,7 +189,15 @@ def api_test_settings(req: SettingsIn):
         data["wan_port_mode"] = req.wan_port_mode
     if req.stun_pool_url is not None:
         data["stun_pool_url"] = req.stun_pool_url
+    if req.notify_enabled is not None:
+        data["notify_enabled"] = "true" if req.notify_enabled else "false"
+    for k in ("notify_kind", "notify_min_gap", "notify_on"):
+        v = getattr(req, k)
+        if v is not None:
+            data[k] = v
     settings.set_values(data)
+    if req.notify_url is not None:
+        db.set_setting("notify_url", req.notify_url.strip())
     try:
         client = ikuai_client.IKuaiClient()
         rules = client.list_dnat()
@@ -218,16 +256,131 @@ def api_create_mapping(req: MappingIn):
     except Exception as e:
         db.update_mapping(m["id"], note=f"创建爱快规则失败: {e}")
         log.error(f"创建爱快规则失败 [{req.name}]: {e}")
+        notifier.rule_failed(req.name, f"创建爱快规则失败：{e}")
     m = db.get_mapping(m["id"])
     log.info(f"新增映射 [{m['name']}] {m['lan_ip']}:{m['lan_port']} "
              f"爱快侧端口={m['wan_port']} 规则ID={m['rule_id']}")
     if not can_probe:
         log.warning(f"[{m['name']}] 目标机 {req.lan_ip} 不是容器自身，"
                     f"无法绑定源地址，跳过 STUN 探测（公网访问地址不可用）")
-    else:
+    notifier.mapping_created(m)
+    if can_probe:
         # 后台即时探测一次，刷新「公网侧端口」（仅用于展示访问地址，不写回爱快）
         threading.Thread(target=poller._provision_probe, args=(m["id"],), daemon=True).start()
     return m
+
+
+_IP_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})$")
+_IPPORT_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})[:：](\d{1,5})$")
+_PROTO_ALIAS = {
+    "tcp": "tcp", "tcp4": "tcp", "tcp6": "tcp",
+    "udp": "udp", "udp4": "udp", "udp6": "udp",
+    "tcp+udp": "tcp+udp", "tcpudp": "tcp+udp", "udp+tcp": "tcp+udp",
+    "tcp4+udp4": "tcp+udp", "all": "any", "any": "any",
+}
+
+
+def parse_rule_line(line):
+    """从一行文本里挖出「名称 / 内网 IP / 内网端口 / 协议」。
+
+    容忍各种粘贴格式，例如爱快穿透规则页复制出来的：
+        UDP4  :39213  EasyTier-udp  —  —  192.168.6.42:27834
+    或手写：
+        QB-RSS, 192.168.6.13, 46065, tcp+udp
+
+    注意：行里的 :39213 这种公网端口一律丢弃 —— 按 CGNAT 端口保留模型，
+    爱快 DNAT 的外网端口必须等于内网端口，把公网端口填进去规则就废了。
+    """
+    s = (line or "").strip()
+    if not s or s.startswith("#"):
+        return None
+    toks = [t for t in re.split(r"[\s,，;；|]+", s) if t and t not in ("—", "-", "–")]
+
+    lan_ip = lan_port = None
+    proto = None
+    name = None
+    for t in toks:
+        m = _IPPORT_RE.match(t)             # 192.168.6.42:27834
+        if m:
+            lan_ip, lan_port = m.group(1), int(m.group(2))
+            continue
+        if _IP_RE.match(t):                 # 192.168.6.13（端口在下一个 token）
+            lan_ip = t
+            continue
+        low = t.lower()
+        if low in _PROTO_ALIAS:
+            proto = _PROTO_ALIAS[low]
+            continue
+        m2 = re.fullmatch(r"(:?)(\d{1,5})", t)
+        if m2:
+            n = int(m2.group(2))
+            # 带冒号前缀的（如 :39213）明确是公网端口，直接丢弃，别拿它当名字
+            if m2.group(1):
+                continue
+            # 紧跟在 IP 后面且还没定端口 → 内网端口；否则是公网端口，丢弃
+            if lan_ip and lan_port is None and 1 <= n <= 65535:
+                lan_port = n
+            continue
+        if name is None:
+            name = t
+    if not lan_ip or not lan_port:
+        return None
+    if not (1 <= lan_port <= 65535):
+        return None
+    # 名称里混入的协议后缀如 EasyTier-udp 不算协议，别被它误导
+    return {
+        "name": name or f"{lan_ip}:{lan_port}",
+        "lan_ip": lan_ip,
+        "lan_port": lan_port,
+        "proto": proto or "tcp",
+    }
+
+
+@app.post("/api/mappings/bulk")
+def api_bulk_mappings(req: BulkIn):
+    """批量录入映射。用来把 Lucky / 爱快穿透规则页上的规则搬过来。"""
+    parsed, bad = [], []
+    for ln in (req.text or "").splitlines():
+        if not ln.strip() or ln.strip().startswith("#"):
+            continue
+        r = parse_rule_line(ln)
+        if r:
+            parsed.append(r)
+        else:
+            bad.append(ln.strip()[:40])
+
+    have = {(m["lan_ip"], int(m["lan_port"]), m["proto"]) for m in db.list_mappings()}
+    mine = local_ips()
+    created, skipped = [], []
+    for r in parsed:
+        key = (r["lan_ip"], r["lan_port"], r["proto"])
+        if key in have:
+            skipped.append({"name": r["name"], "reason": "本地已有相同映射"})
+            continue
+        can_probe = r["lan_ip"] in mine
+        m = db.create_mapping(
+            name=r["name"], lan_ip=r["lan_ip"], lan_port=r["lan_port"],
+            proto=r["proto"], wan_port=r["lan_port"], wan_port_manual=0,
+            probe=1 if can_probe else 0,
+        )
+        if req.create_rules:
+            try:
+                rid = ikuai_client.IKuaiClient().create_dnat({
+                    "name": r["name"], "lan_ip": r["lan_ip"],
+                    "lan_port": r["lan_port"], "proto": r["proto"],
+                    "wan_port": r["lan_port"],
+                })
+                if rid:
+                    db.update_mapping(m["id"], rule_id=rid)
+            except Exception as e:
+                db.update_mapping(m["id"], note=f"创建爱快规则失败: {e}")
+                log.error(f"批量创建爱快规则失败 [{r['name']}]: {e}")
+                notifier.rule_failed(r["name"], f"创建爱快规则失败：{e}")
+        have.add(key)
+        created.append(db.get_mapping(m["id"]))
+        log.info(f"批量新增 [{r['name']}] {r['lan_ip']}:{r['lan_port']} ({r['proto']})")
+        notifier.mapping_created(db.get_mapping(m["id"]))
+    return {"created": created, "skipped": skipped, "unparsed": bad}
 
 
 @app.delete("/api/mappings/{mid}")
@@ -241,7 +394,9 @@ def api_delete_mapping(mid: int):
             log.info(f"删除映射 [{m['name']}] 并移除爱快规则 {m['rule_id']}")
         except Exception as e:
             log.error(f"删除爱快规则失败: {e}")
+            notifier.rule_failed(m["name"], f"删除爱快规则失败：{e}")
     db.delete_mapping(mid)
+    notifier.mapping_deleted(m)
     return {"ok": True}
 
 

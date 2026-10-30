@@ -22,6 +22,14 @@ _SCHEMA = {
     "wan_port_mode": (("WAN_PORT_MODE",), "preserve"),
     # STUN 清单地址：可填 raw 直链，也可直接粘 GitHub 网页地址（会自动纠正）
     "stun_pool_url": (("STUN_POOL_URL",), ""),
+    # 变更通知（对应 Lucky 的「STUN 穿透 + Webhook 推送」）
+    "notify_enabled": (("NOTIFY_ENABLED",), "false"),
+    # 推送目标：custom / dingtalk / wecom / feishu / bark
+    "notify_kind": (("NOTIFY_KIND",), "custom"),
+    "notify_url": (("NOTIFY_URL",), ""),
+    # 同一映射的最小推送间隔（秒）。CGNAT 端口会漂移，不加冷却会疯狂刷屏。
+    "notify_min_gap": (("NOTIFY_MIN_GAP",), "600"),
+    "notify_on": (("NOTIFY_ON",), "port,mapping,reconcile"),
 }
 
 #: 对外展示时不应回显明文的配置项
@@ -74,6 +82,11 @@ def public_view():
         "stun_pool_url": get("stun_pool_url"),
         "ikuai_token_set": bool(get("ikuai_token")),
         "ikuai_configured": bool(get("ikuai_token")),
+        "notify_enabled": get_bool("notify_enabled"),
+        "notify_kind": get("notify_kind"),
+        "notify_url": get("notify_url"),
+        "notify_min_gap": get("notify_min_gap"),
+        "notify_on": get("notify_on"),
         # 来源提示：告诉用户当前值是来自 WebUI 还是环境变量
         "sources": {k: ("webui" if db.get_setting(k) else "env") for k in _SCHEMA},
     }
