@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>stun · DNAT/STUN 管理器</title>
+<style>
+  :root{
+    --bg:#0f1420; --panel:#18202e; --panel2:#1f2a3a; --line:#2a3650;
+    --txt:#e6edf6; --muted:#8aa0bd; --accent:#3b82f6; --green:#22c55e;
+    --red:#ef4444; --amber:#f59e0b; --chip:#243049;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,"Segoe UI",Roboto,"PingFang SC","Microsoft YaHei",sans-serif;
+       background:var(--bg);color:var(--txt);font-size:14px}
+  header{padding:14px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:14px}
+  header h1{font-size:18px;margin:0;letter-spacing:.5px}
+  header .sub{color:var(--muted);font-size:12px}
+  .wrap{padding:18px 20px;max-width:1200px;margin:0 auto}
+  .alert{background:rgba(239,68,68,.12);border:1px solid var(--red);color:#ffd5d5;
+         padding:10px 14px;border-radius:8px;margin-bottom:14px;font-weight:600}
+  .tabs{display:flex;gap:8px;margin-bottom:16px}
+  .tab{padding:8px 16px;border:1px solid var(--line);border-radius:8px;cursor:pointer;color:var(--muted);background:var(--panel)}
+  .tab.active{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+  .card h3{margin:0 0 12px;font-size:15px}
+  table{width:100%;border-collapse:collapse}
+  th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:13px}
+  th{color:var(--muted);font-weight:600}
+  tr.suspended{opacity:.5}
+  tr.mismatch{background:rgba(192,57,43,.08)}
+  .btn{border:1px solid var(--line);background:var(--panel2);color:var(--txt);
+        padding:6px 12px;border-radius:7px;cursor:pointer;font-size:13px}
+  .btn:hover{border-color:var(--accent)}
+  .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+  .btn.danger{background:rgba(239,68,68,.15);border-color:var(--red);color:#ffb4b4}
+  .btn.small{padding:4px 9px;font-size:12px}
+  input,select{background:var(--panel2);border:1px solid var(--line);color:var(--txt);
+        padding:7px 9px;border-radius:7px;font-size:13px;width:100%}
+  .form{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;align-items:end}
+  .form label{display:block;color:var(--muted);font-size:12px;margin-bottom:4px}
+  .status-dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px}
+  .s-active{background:var(--green)} .s-suspended{background:var(--amber)} .s-down{background:var(--red)}
+  .badge{background:var(--chip);padding:2px 8px;border-radius:6px;font-size:12px;color:var(--muted)}
+  .kv{display:flex;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:12px}
+  .kv b{color:var(--txt)}
+  .row-actions{display:flex;gap:6px}
+  .muted{color:var(--muted)}
+  .logbox{background:#0b1120;border:1px solid var(--line);border-radius:8px;padding:12px;
+          margin:0;max-height:520px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;
+          font-size:12px;line-height:1.65;white-space:pre-wrap;word-break:break-all}
+  .logbox .lvl{font-weight:700}
+  .lv-INFO{color:#7dd3fc} .lv-WARNING{color:var(--amber)}
+  .lv-ERROR{color:#ff8a8a} .lv-DEBUG{color:var(--muted)}
+</style>
+</head>
+<body>
+<header>
+  <h1>stun</h1>
+  <span class="sub">DNAT / STUN 管理器 · 摆脱 Lucky · 多 macvlan 映射</span>
+</header>
+<div class="wrap">
+  <div id="alert" class="alert" style="display:none"></div>
+  <div class="kv" id="statusbar"></div>
+
+  <div class="tabs">
+    <div class="tab active" data-tab="map">映射管理</div>
+    <div class="tab" data-tab="stun">STUN 服务器</div>
+    <div class="tab" data-tab="set">设置</div>
+    <div class="tab" data-tab="log">日志</div>
+  </div>
+
+  <!-- 映射管理 -->
+  <section id="tab-map">
+    <div class="card">
+      <h3>添加映射</h3>
+      <div class="form">
+        <div><label>名称</label><input id="m_name" placeholder="如 tr下载机 / Emby影音"/></div>
+        <div><label>内网 IP</label><input id="m_ip" placeholder="192.168.6.10"/></div>
+        <div><label>内网端口</label><input id="m_port" type="number" placeholder="9091"/></div>
+        <div><label>协议</label>
+          <select id="m_proto">
+            <option value="tcp">tcp</option>
+            <option value="udp">udp</option>
+            <option value="tcp+udp">tcp+udp</option>
+            <option value="any">any</option>
+          </select>
+        </div>
+        <div><label>外网端口(可选)</label><input id="m_wan" type="number" placeholder="留空=与内网端口一致"/></div>
+        <div><button class="btn primary" onclick="addMapping()">添加并建爱快规则</button></div>
+      </div>
+      <p class="muted" style="margin:10px 0 0">
+        留空则爱快 DNAT 的「外网端口」与内网端口一致（默认，也是你现有 QB/TR 映射的写法）。
+        入站流量经 CGNAT 还原后，到达爱快的就是内网端口，所以规则要按内网端口匹配。
+        对外发布用的地址看表格里的「公网访问地址」，那个是 STUN 实测值。
+        添加后会立即在爱快创建 DNAT 规则并触发一次探测。
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>当前映射</h3>
+      <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn" onclick="reconcile()">立即与爱快对账</button>
+        <span class="muted">发现路由上外网端口与本地不一致时，直接推回去（每 5 分钟自动执行）</span>
+      </div>
+      <table>
+        <thead><tr>
+          <th>名称</th><th>内网 IP:端口</th><th>协议</th>
+          <th>外网端口(爱快)</th><th>公网访问地址</th>
+          <th>爱快规则ID</th><th>状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="map_body"></tbody>
+      </table>
+      <p class="muted" style="margin:10px 0 0">
+        「外网端口(爱快)」是对账时从路由上读回的真实值，不是本地想当然的值；
+        默认应与内网端口一致。若不一致，该行标红显示「未同步」，每 5 分钟自动推一次，
+        也可点上方按钮立即对账。
+        「公网访问地址」由 STUN 实测得出，是发给别人访问用的地址。
+      </p>
+    </div>
+  </section>
+
+  <!-- STUN 服务器 -->
+  <section id="tab-stun" style="display:none">
+    <div class="card">
+      <h3>STUN 服务器池</h3>
+      <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn primary" onclick="scanStun()">立即扫描</button>
+        <button class="btn" onclick="refreshPool()">从 always-online-stun 更新清单</button>
+        <span id="pool_msg" class="muted"></span>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        清单来源 <code>pradt2/always-online-stun</code>（官方每小时刷新），
+        容器每小时自动更新一次；国内访问不畅时自动沿用内置清单。
+      </p>
+      <table>
+        <thead><tr>
+          <th>主机</th><th>端口</th><th>状态</th><th>延迟(ms)</th><th>传输</th><th>最后检查</th><th>操作</th>
+        </tr></thead>
+        <tbody id="stun_body"></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>手动添加服务器</h3>
+      <div class="form">
+        <div><label>主机</label><input id="s_host" placeholder="stun.example.com"/></div>
+        <div><label>端口</label><input id="s_port" type="number" value="3478"/></div>
+        <div><label>支持NAT检测</label>
+          <select id="s_nat"><option value="0">否</option><option value="1">是</option></select>
+        </div>
+        <div><button class="btn primary" onclick="addStun()">添加</button></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 设置 -->
+  <section id="tab-set" style="display:none">
+    <div class="card">
+      <h3>爱快连接设置</h3>
+      <p class="muted" style="margin:0 0 12px">
+        在这里填一次即可，不需要写进 docker-compose。修改后立即生效，无需重启容器。
+      </p>
+      <div class="form">
+        <div><label>爱快管理地址</label><input id="set_url" placeholder="https://192.168.6.254"/></div>
+        <div><label>个人 API 令牌</label><input id="set_token" type="password" placeholder="留空则沿用已保存的令牌"/></div>
+        <div><label>WAN 接口名</label><input id="set_iface" placeholder="adsl1"/></div>
+        <div><label>校验 HTTPS 证书</label>
+          <select id="set_ssl"><option value="0">否（自签证书）</option><option value="1">是</option></select>
+        </div>
+        <div><label>外网端口取哪个值</label>
+          <select id="set_mode">
+            <option value="preserve">端口保留（等于内网端口，默认/常用）</option>
+            <option value="stun">STUN 实测值（仅当改端口的是爱快自己）</option>
+          </select>
+        </div>
+        <div class="muted" style="grid-column:1/-1">
+          判据：STUN 实测端口 ≠ 内网端口 → 是运营商 CGNAT 在改端口，必须用「端口保留」；
+          实测端口 = 内网端口 → 两种模式等价，保持默认即可。
+        </div>
+      </div>
+      <div class="form" style="margin-top:12px">
+        <div style="grid-column:1/-1">
+          <label>STUN 清单地址</label>
+          <input id="set_pool" placeholder="https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_hosts_tcp.txt"/>
+        </div>
+      </div>
+      <p class="muted" style="margin:10px 0 0">
+        可直接粘贴 GitHub 网页地址（<code>github.com/…/blob/master/valid_hosts_tcp.txt</code>），
+        程序会自动转成 raw 直链；国内不通时再自动退回 jsDelivr / 镜像。
+        留空则用内置的默认地址。
+      </p>
+      <p class="muted" style="margin:10px 0 0">
+        <b>STUN 实测值</b>：把 STUN 探到的公网端口写进爱快 DNAT 的「外网端口」。
+        适用于无公网/CGNAT —— 改端口的是运营商那一层，爱快直接用公网端口。<br/>
+        <b>端口保留</b>：外网端口等于内网端口，公网端口只在页面展示。
+        适用于改端口的是爱快本身的情况。
+      </p>
+      <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn primary" onclick="saveSettings()">保存并试连</button>
+        <button class="btn" onclick="loadSettings()">重新载入</button>
+        <span id="set_msg" class="muted"></span>
+      </div>
+      <div id="set_state" class="muted" style="margin-top:10px"></div>
+      <p class="muted" style="margin:10px 0 0">
+        地址只需填到路由地址（如 <code>https://192.168.6.254</code>），
+        程序会自动补 <code>/api/v4.0</code>。
+      </p>
+    </div>
+  </section>
+
+  <!-- 日志 -->
+  <section id="tab-log" style="display:none">
+    <div class="card">
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+        <h3 style="margin:0;flex:1">运行日志</h3>
+        <button class="btn" onclick="loadLogs()">刷新</button>
+        <button class="btn danger" onclick="clearLogs()">清空</button>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        记录 NAT 检测、STUN 扫描、端口探测、爱快规则增删等运行事件（保留最近 500 条）。
+        完整容器日志见 Portainer 容器页的 Logs。
+      </p>
+      <pre id="log_body" class="logbox"></pre>
+    </div>
+  </section>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+function fmt(v){return v===null||v===undefined?"—":v;}
+
+async function loadStatus(){
+  try{
+    const s = await (await fetch("/api/status")).json();
+    EXT_IP = s.external_ip || null;
+    ROUTER = s.router_wan_ports || {};
+    const bar = $("statusbar");
+    bar.innerHTML = `
+      <span>NAT 类型: <b>${fmt(s.nat_type)}</b></span>
+      <span>公网 IP: <b>${fmt(s.external_ip)}</b></span>
+      <span>映射: <b>${s.counts.active}</b> 活跃 / <b>${s.counts.suspended}</b> 挂起</span>
+      <span>爱快: <b>${s.ikuai_configured?"已配置":"未配置/未填令牌"}</b></span>
+      <span>模式: <b>${s.mock?"Mock":"真实"}</b></span>`;
+    const al = $("alert");
+    if(s.nat_blocked){
+      al.style.display="block";
+      al.textContent = `⚠ 检测到 NAT 异常（${s.nat_type}）：STUN 打洞无效，主轮询已暂停，相关映射已挂起。恢复后将自动重建爱快规则。`;
+    } else { al.style.display="none"; }
+  }catch(e){}
+}
+
+let EXT_IP = null;
+let ROUTER = {};
+async function loadMappings(){
+  const rows = await (await fetch("/api/mappings")).json();
+  const tb = $("map_body"); tb.innerHTML="";
+  rows.forEach(m=>{
+    const tr = document.createElement("tr");
+    if(m.status==="suspended") tr.className="suspended";
+    const dot = m.status==="active"?"s-active":"s-suspended";
+    const addr = (EXT_IP && m.public_port) ? `${EXT_IP}:${m.public_port}` : (m.public_port?`:${m.public_port}`:"—");
+    // 爱快上真实生效的外网端口（对账读回）；与本地不一致时标红提示
+    const live = m.rule_id ? (ROUTER[String(m.rule_id)] || null) : null;
+    const want = String(m.wan_port || m.lan_port);
+    const miss = (live !== null && String(live) !== want);
+    if(miss) tr.className = (tr.className ? tr.className + " " : "") + "mismatch";
+    const cell = miss
+      ? `<td><b style="color:var(--danger,#c0392b)">${live}</b> <span class="muted">→ 应为 ${want}</span></td>`
+      : `<td>${fmt(m.wan_port)}</td>`;
+    tr.innerHTML = `
+      <td>${m.name}</td>
+      <td>${m.lan_ip}:${m.lan_port}</td>
+      <td><span class="badge">${m.proto}</span></td>
+      ${cell}
+      <td>${addr}</td>
+      <td>${fmt(m.rule_id)}</td>
+      <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?" <span class='badge' style='background:#c0392b;color:#fff'>未同步</span>":""}</td>
+      <td><div class="row-actions">
+        ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
+        <button class="btn small danger" onclick="del(${m.id})">删除</button>
+      </div></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function loadStun(){
+  const rows = await (await fetch("/api/stun")).json();
+  const tb = $("stun_body"); tb.innerHTML="";
+  rows.forEach(s=>{
+    const tr = document.createElement("tr");
+    const dot = s.status==="active"?"s-active":(s.status==="down"?"s-down":"s-suspended");
+    tr.innerHTML = `
+      <td>${s.host}</td>
+      <td>${s.port}</td>
+      <td><span class="status-dot ${dot}"></span>${s.status}</td>
+      <td>${fmt(s.latency)}</td>
+      <td><span class="badge">${s.transport?String(s.transport).toUpperCase():"未测"}</span></td>
+      <td>${fmt(s.last_check)}</td>
+      <td><button class="btn small danger" onclick="delStun(${s.id})">删除</button></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+async function addMapping(){
+  const body = {
+    name:$("m_name").value, lan_ip:$("m_ip").value,
+    lan_port:Number($("m_port").value), proto:$("m_proto").value,
+    wan_port: $("m_wan").value?Number($("m_wan").value):null
+  };
+  if(!body.name||!body.lan_ip||!body.lan_port){alert("请填名称、IP、端口");return;}
+  const r = await fetch("/api/mappings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  if(r.ok){ $("m_name").value="";$("m_ip").value="";$("m_port").value="";$("m_wan").value=""; refresh(); }
+  else alert("添加失败："+(await r.text()));
+}
+async function del(id){ if(!confirm("删除该映射并同步删除爱快规则？"))return; await fetch("/api/mappings/"+id,{method:"DELETE"}); refresh(); }
+async function resume(id){ await fetch("/api/mappings/"+id+"/resume",{method:"POST"}); refresh(); }
+async function reconcile(){ await fetch("/api/mappings/reconcile",{method:"POST"}); refresh(); }
+
+async function scanStun(){ const b=$("alert"); b.style.display="none"; await fetch("/api/stun/scan",{method:"POST"}); loadStun(); loadStatus(); }
+async function refreshPool(){
+  const el=$("pool_msg");
+  el.style.color="var(--muted)"; el.textContent="正在拉取最新清单…";
+  const j = await (await fetch("/api/stun/refresh",{method:"POST"})).json();
+  if(j.ok){
+    el.style.color="var(--green)";
+    el.textContent=`✓ 清单 ${j.total} 条，新增 ${j.added} 条 [${j.url||""}]，正在扫描…`;
+    await fetch("/api/stun/scan",{method:"POST"});
+    el.textContent=`✓ 清单 ${j.total} 条，新增 ${j.added} 条，扫描完成`;
+  }else{
+    el.style.color="var(--red)";
+    el.textContent=`✗ 更新失败：${j.error}（已沿用内置清单）`;
+  }
+  loadStun(); loadStatus();
+}
+async function addStun(){
+  const host=$("s_host").value, port=Number($("s_port").value),
+        nat_capable=Number($("s_nat").value);
+  if(!host){alert("请填主机");return;}
+  await fetch("/api/stun",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({host,port,nat_capable})});
+  $("s_host").value=""; loadStun();
+}
+async function delStun(id){ await fetch("/api/stun/"+id,{method:"DELETE"}); loadStun(); }
+
+/* ---------------- 设置 ---------------- */
+async function loadSettings(){
+  const s = await (await fetch("/api/settings")).json();
+  $("set_url").value = s.ikuai_base_url || "";
+  $("set_token").value = "";
+  $("set_iface").value = s.ikuai_interface || "";
+  $("set_ssl").value = s.ikuai_verify_ssl ? "1" : "0";
+  $("set_mode").value = s.wan_port_mode || "preserve";
+  $("set_pool").value = s.stun_pool_url || "";
+  $("set_state").innerHTML =
+    `令牌：<b>${s.ikuai_token_set ? "已设置" : "未设置"}</b> ｜ ` +
+    `实际调用基址：<b>${s.ikuai_api_base || "—"}</b>`;
+}
+async function saveSettings(){
+  const body = {
+    ikuai_base_url: $("set_url").value.trim(),
+    ikuai_token: $("set_token").value.trim(),
+    ikuai_interface: $("set_iface").value.trim(),
+    ikuai_verify_ssl: $("set_ssl").value === "1",
+    wan_port_mode: $("set_mode").value,
+    stun_pool_url: $("set_pool").value.trim()
+  };
+  const r = await fetch("/api/settings/test",{
+    method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+  const j = await r.json();
+  const el = $("set_msg");
+  if(j.ok){
+    el.style.color = "var(--green)";
+    el.textContent = `✓ 连接成功：${j.api_base}，读取到 ${j.dnat_rules} 条 DNAT 规则`;
+  }else{
+    el.style.color = "var(--red)";
+    el.textContent = `✗ 连接失败：${j.error}`;
+  }
+  await loadSettings(); loadStatus();
+}
+
+/* ---------------- 日志 ---------------- */
+async function loadLogs(){
+  try{
+    const j = await (await fetch("/api/logs?limit=300")).json();
+    const box = $("log_body");
+    if(!j.items || j.items.length===0){
+      box.innerHTML = '<span class="muted">暂无日志</span>';
+      return;
+    }
+    box.innerHTML = j.items.map(it=>
+      `<span class="muted">${it.time}</span> ` +
+      `<span class="lvl ${"lv-"+it.level}">[${it.level}]</span> ` +
+      `<span class="muted">${it.logger}</span> ${it.msg}`
+    ).join("\n");
+    // 自动滚到底部，看到最新
+    box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
+async function clearLogs(){
+  await fetch("/api/logs",{method:"DELETE"});
+  loadLogs();
+}
+
+async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); }
+setInterval(refresh, 15000);
+setInterval(()=>{ if($("tab-log").style.display!=="none") loadLogs(); }, 5000);
+
+document.querySelectorAll(".tab").forEach(t=>{
+  t.onclick=()=>{
+    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    t.classList.add("active");
+    const which=t.dataset.tab;
+    ["map","stun","set","log"].forEach(k=>{
+      $("tab-"+k).style.display = which===k?"block":"none";
+    });
+    if(which==="set") loadSettings();
+    if(which==="log") loadLogs();
+  };
+});
+refresh();
+</script>
+</body>
+</html>

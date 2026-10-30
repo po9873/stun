@@ -1,0 +1,101 @@
+# STUN 服务器种子池
+# 来源：pradt2/always-online-stun -> valid_hosts_tcp.txt（TCP 可用性，每小时刷新）
+# 格式：host:port:natflag
+#   natflag=1 表示该服务器同时具备 RFC 5780 NAT 行为检测能力（提供 OTHER-ADDRESS），
+#            取自 valid_nat_testing_hosts_tcp.txt，用于 NAT 类型判定。
+#   natflag=0 仅能用于端口映射探测。
+#
+# 说明：本程序默认走 STUN over TCP（UDP 3478 在部分网络被封，实测本环境 UDP 不通、
+#       TCP 通），扫描时先 TCP、失败再回退 UDP，并按实测延迟排序取最快节点。
+stun.vomessen.de:3478:1
+stun.skydrone.aero:3478:1
+stun.sonetel.com:3478:1
+stun.voztovoice.org:3478:0
+stun.sonetel.net:3478:1
+stun.godatenow.com:3478:0
+stun.mixvoip.com:3478:1
+stun.geesthacht.de:3478:0
+stun.yesdates.com:3478:0
+stun.telnyx.com:3478:0
+stun.eol.co.nz:3478:0
+stun.ru-brides.com:3478:0
+stun.frozenmountain.com:3478:0
+stun.pure-ip.com:3478:1
+stun.tula.nu:3478:1
+stun.uabrides.com:3478:0
+stun.fitauto.ru:3478:1
+stun.telviva.com:3478:0
+stun.tel2.co.uk:3478:0
+stun.vavadating.com:3478:0
+stun.bitburger.de:3478:0
+stun.siplogin.de:3478:0
+stun.axialys.net:3478:1
+stun.irishvoip.com:3478:0
+stun.healthtap.com:3478:0
+stun.m-online.net:3478:1
+stun.threema.ch:3478:0
+stun.signalwire.com:3478:1
+stun.genymotion.com:3478:0
+stun.ipfire.org:3478:0
+stun.graftlab.com:3478:0
+stun.cellmail.com:3478:0
+stun.alpirsbacher.de:3478:0
+stun.peethultra.be:3478:0
+stun.dus.net:3478:1
+stun.linuxtrent.it:3478:0
+stun.voip.blackberry.com:3478:0
+stun.business-isp.nl:3478:1
+stun.atagverwarming.nl:3478:0
+stun.webfreak.org:3478:0
+stun.ukh.de:3478:0
+stun.siptrunk.com:3478:1
+stun.engineeredarts.co.uk:3478:0
+stun.sip.us:3478:1
+stun.flashdance.cx:3478:0
+stun.sipthor.net:3478:0
+stun.cope.es:3478:1
+stun.nextcloud.com:443:1
+stun.annatel.net:3478:0
+stun.sipnet.net:3478:0
+stun.freeswitch.org:3478:1
+stun.stochastix.de:3478:1
+stun.voipgate.com:3478:1
+stun.bethesda.net:3478:1
+stun.files.fm:3478:0
+stun.thinkrosystem.com:3478:0
+stun.poetamatusel.org:3478:0
+stun.fmo.de:3478:0
+stun.peeters.com:3478:0
+stun.technosens.fr:3478:0
+stun.kaseya.com:3478:0
+stun.ttmath.org:3478:0
+stun.ncic.com:3478:0
+stun.ringostat.com:3478:1
+stun.lovense.com:3478:1
+stun.diallog.com:3478:1
+stun.moonlight-stream.org:3478:0
+stun.baltmannsweiler.de:3478:0
+stun.oncloud7.ch:3478:0
+stun.zentauron.de:3478:0
+stun.romancecompass.com:3478:0
+stun.nanocosmos.de:3478:0
+stun.radiojar.com:3478:1
+stun.verbo.be:3478:0
+stun.acronis.com:3478:0
+stun.zepter.ru:3478:0
+stun.framasoft.org:3478:0
+stun.meetwife.com:3478:0
+stun.voipia.net:3478:1
+stun.bridesbay.com:3478:0
+stun.kanojo.de:3478:0
+stun.nextcloud.com:3478:1
+stun.romaaeterna.nl:3478:1
+stun.dcalling.de:3478:1
+stun.hot-chilli.net:3478:0
+stun.finsterwalder.com:3478:0
+# 以下为 UDP 常用节点，UDP 可用时会因低延迟被优先选中
+stun.qq.com:3478:0
+stun.miwifi.com:3478:0
+stun.chat.bilibili.com:3478:0
+stun1.l.google.com:19302:0
+stun2.l.google.com:19302:0

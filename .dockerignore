@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+*.pyo
+.git/
+.github/
+.gitignore
+data/
+*.db
+*.log
+.env
+stun.zip
+stun_build.tar.gz
+README.md

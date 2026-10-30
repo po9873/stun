@@ -1,0 +1,5 @@
+fastapi
+uvicorn[standard]
+requests
+# STUN 不再依赖 pystun3：pystun3 只支持 UDP，而本环境的 UDP 3478 被封。
+# 现改用 app/rfc5389.py 自带的纯标准库实现，走 STUN over TCP（并保留 UDP 回退）。
