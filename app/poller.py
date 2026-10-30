@@ -111,16 +111,19 @@ def _poll_mappings(client):
         # 服务器由 probe_mapping_port 按映射的协议去挑（TCP 映射只用 TCP 服务器）
         try:
             return m, stun_probe.probe_mapping_port(
-                m["lan_ip"], m["lan_port"], proto=m["proto"])
+                m["lan_ip"], m["lan_port"], proto=m["proto"]), \
+                stun_probe.used_server(m["lan_ip"], m["lan_port"], m["proto"])
         except Exception as e:
             log.debug(f"探测异常 [{m['name']}]: {e}")
-            return m, (None, None, False)
+            return m, (None, None, False), None
 
     # 并行测：串行的话 11 条要好几分钟才轮一遍，心跳间隔太长映射会被回收
     with ThreadPoolExecutor(max_workers=6) as ex:
         results = list(ex.map(_probe, targets))
 
-    for m, (ext_ip, ext_port, _exact) in results:
+    for m, (ext_ip, ext_port, _exact), sv in results:
+        # 记下这次真正在用的那台服务器，页面上能直接看到
+        used = {"stun_host": sv["host"], "stun_port": sv["port"]} if sv else {}
         if ext_port is None:
             fc = (m["fail_count"] or 0) + 1
             # 测不到只是拿不到公网地址，爱快那条普通映射照样能用，
@@ -129,7 +132,7 @@ def _poll_mappings(client):
             continue
         if ext_ip:
             _note_ext_ip(ext_ip)
-        db.update_mapping(m["id"], fail_count=0)
+        db.update_mapping(m["id"], fail_count=0, **used)
         if m.get("public_port") == ext_port:
             continue
         old = m.get("public_port")
@@ -359,8 +362,11 @@ def _provision_probe(id):
     ext_ip, ext_port, exact = stun_probe.probe_mapping_port(
         m["lan_ip"], m["lan_port"], proto=m["proto"]
     )
+    sv = stun_probe.used_server(m["lan_ip"], m["lan_port"], m["proto"])
     if ext_port is None:
         return
     db.update_mapping(id, public_port=ext_port, fail_count=0,
-                      public_exact=1 if exact else 0)
+                      public_exact=1 if exact else 0,
+                      **({"stun_host": sv["host"], "stun_port": sv["port"]}
+                         if sv else {}))
     _sync_wan_port(ikuai_client.IKuaiClient(), db.get_mapping(id), ext_port, exact)

@@ -300,6 +300,25 @@ _sticky = {}
 _conns = {}
 _conn_lock = threading.Lock()
 
+# 每条映射最近一次真正问通的那台服务器：(内网IP, 端口, 协议) -> {host, port, ts}
+# 页面靠它显示「这条映射现在到底在问哪台服务器」
+_used = {}
+_used_lock = threading.Lock()
+
+
+def _mark_used(key, sv):
+    with _used_lock:
+        _used[key] = {"host": sv["host"], "port": int(sv["port"]),
+                      "transport": sv.get("transport") or "", "ts": time.time()}
+
+
+def used_server(lan_ip, lan_port, proto=None):
+    """这条映射最近一次问通的那台 STUN 服务器；还没问通过则返回 None。"""
+    key = (lan_ip, int(lan_port), "udp" if proto == "udp" else "tcp")
+    with _used_lock:
+        item = _used.get(key)
+    return dict(item) if item else None
+
 
 def _conn_take(key, want, candidates, timeout):
     """取出这条映射保持住的连接；没有或被掐断了就新建一条。"""
@@ -353,6 +372,9 @@ def prune_conns(alive_keys):
         keys = [k for k in _conns if k not in alive_keys]
     for k in keys:
         _conn_drop(k)
+    with _used_lock:
+        for k in [k for k in _used if k not in alive_keys]:
+            _used.pop(k, None)
 
 
 def probe_mapping_port(lan_ip, lan_port, server=None, timeout=None, proto=None):
@@ -410,6 +432,7 @@ def probe_mapping_port(lan_ip, lan_port, server=None, timeout=None, proto=None):
             )
             if ext_port is not None:
                 _sticky[key] = c
+                _mark_used(key, c)
                 return ext_ip, ext_port, exact
         return (None, None, False)
 
@@ -426,6 +449,7 @@ def probe_mapping_port(lan_ip, lan_port, server=None, timeout=None, proto=None):
             resp = rfc5389.exchange(sock, req, tid, timeout)
             if resp.get("mapped"):
                 _sticky[key] = sv
+                _mark_used(key, sv)
                 return resp["mapped"][0], resp["mapped"][1], exact
         except Exception as e:
             log.debug(f"复用连接问 {lan_ip}:{lan_port} 失败({e})，重建")

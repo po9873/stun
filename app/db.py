@@ -89,7 +89,10 @@ def init():
                          # relay=1：这条走容器中转。容器独占 relay_port 这个端口，
                          # 自己测公网端口并把流量转发给真正的目标机
                          ("relay", "INTEGER DEFAULT 0"),
-                         ("relay_port", "INTEGER")):
+                         ("relay_port", "INTEGER"),
+                         # 这条映射最近一次问通的 STUN 服务器（页面展示「在用哪台」）
+                         ("stun_host", "TEXT"),
+                         ("stun_port", "INTEGER")):
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 

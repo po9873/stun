@@ -47,6 +47,8 @@
   .row-actions{display:flex;gap:6px}
   .muted{color:var(--muted)}
   .sub-id{color:var(--muted);font-size:11px;margin-left:5px}
+  .svr{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  .svr.used{color:var(--green);font-weight:600}
   .code-box{background:var(--bg);padding:8px 10px;border:1px solid var(--line);border-radius:6px;
             overflow-x:auto;white-space:pre-wrap;word-break:break-all;
             font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
@@ -144,6 +146,7 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
       <table>
         <thead><tr>
           <th>名称</th><th>内网 IP:端口</th><th>协议</th>
+          <th title="这条映射固定问的那一台，换了服务器就等于新开一条流、公网端口会变">探测服务器</th>
           <th title="外部访问时用的端口，就是公网访问地址里的那个端口">公网端口</th><th>公网访问地址</th>
           <th title="和爱快界面上的序号一致（灰色小字是路由内部 ID，删过规则会留空号）">#</th>
           <th>状态</th><th>操作</th>
@@ -319,6 +322,10 @@ async function loadMappings(){
     const want = String(m.wan_port || m.lan_port);
     const miss = (live !== null && String(live) !== want);
     if(miss) tr.className = (tr.className ? tr.className + " " : "") + "mismatch";
+    // 这条映射实际在问哪台服务器（固定一台，换了公网端口就会变）
+    const svCell = m.stun_host
+      ? `<td><span class="svr">${m.stun_host}:${m.stun_port}</span></td>`
+      : `<td><span class="muted">—</span></td>`;
     // 公网端口就是公网访问地址里的那个端口，两者永远一致；测不出就留空
     const cell = m.public_port
       ? `<td><b>${m.public_port}</b>${m.public_exact?"":`<span class="sub-id" title="还没实测过，仅供参考">?</span>`}</td>`
@@ -327,6 +334,7 @@ async function loadMappings(){
       <td>${m.name}</td>
       <td>${m.lan_ip}:${m.lan_port}</td>
       <td><span class="badge">${m.proto}</span></td>
+      ${svCell}
       ${cell}
       <td>${addr}</td>
       <td>${idx+1}${m.rule_id?`<span class="sub-id" title="爱快的内部规则 ID（删过规则会留空号）">#${m.rule_id}</span>`:""}</td>
@@ -365,13 +373,24 @@ async function copyText(t, btn){
 }
 
 async function loadStun(){
-  const rows = await (await fetch("/api/stun")).json();
+  const [rows, maps] = await Promise.all([
+    fetch("/api/stun").then(r=>r.json()),
+    fetch("/api/mappings").then(r=>r.json()),
+  ]);
+  // 哪些服务器正被映射用着（每条映射固定一台，这里标出来一眼能看出用的是哪几台）
+  const use = {};
+  maps.forEach(m=>{
+    if(!m.stun_host) return;
+    const k = `${m.stun_host}:${m.stun_port}`;
+    (use[k] = use[k] || []).push(m.name);
+  });
   const tb = $("stun_body"); tb.innerHTML="";
   rows.forEach(s=>{
     const tr = document.createElement("tr");
     const dot = s.status==="active"?"s-active":(s.status==="down"?"s-down":"s-suspended");
+    const u = use[`${s.host}:${s.port}`] || null;
     tr.innerHTML = `
-      <td>${s.host}</td>
+      <td>${s.host}${u?`<span class="svr used" title="正在给 ${u.join("、")} 用"> 使用中${u.length>1?`×${u.length}`:""}</span>`:""}</td>
       <td>${s.port}</td>
       <td><span class="status-dot ${dot}"></span>${s.status}</td>
       <td>${fmt(s.latency)}</td>
