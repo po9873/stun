@@ -68,6 +68,9 @@ def _poll_mappings(client):
     for m in db.list_mappings():
         if m["status"] != "active":
             continue
+        # probe=0：目标机不是容器自己，探测结果无意义，不做无谓的 STUN 握手
+        if not m.get("probe", 1):
+            continue
         server = db.get_best_stun_server()
         if not server:
             # 池子全被判 down：立刻扫一遍自救，而不是干等下个小时
@@ -93,8 +96,12 @@ def _poll_mappings(client):
             log.info(f"公网端口变化 [{m['name']}] {m.get('public_port')} -> {ext_port}"
                      f" ({'精确' if exact else '近似'})")
             db.update_mapping(m["id"], public_port=ext_port)
+        # 记录这次探测是不是真的绑到了目标内网 IP。跨 IP 探测（目标机不是容器自己）
+        # 时 CGNAT 给的公网端口可能不同，页面上要能区分，不能给出假精度。
+        if bool(exact) != bool(m.get("public_exact", 1)):
+            db.update_mapping(m["id"], public_exact=1 if exact else 0)
         # 每轮都对齐一次，这样切模式/重启后能自动纠正不一致
-        _sync_wan_port(client, db.get_mapping(m["id"]), ext_port)
+        _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, exact)
 
 
 def _check_nat(client):
@@ -116,16 +123,22 @@ def _check_nat(client):
                 _resume(client, m)
 
 
-def _sync_wan_port(client, m, public_port):
+def _sync_wan_port(client, m, public_port, exact=True):
     """按模式决定是否把探测到的公网端口同步进爱快 DNAT 的 wan_port。
 
     stun     模式：wan_port = STUN 实测公网端口（无公网/CGNAT 常用）
     preserve 模式：wan_port = 内网端口（端口保留），公网端口只展示
+
+    exact=False 表示探测没能绑定到这条映射的内网 IP（跨 IP 探测），此时测到的
+    公网端口属于容器自己那条 CGNAT 映射，与目标机毫无关系。
+    把它写进爱快会让 QB/TR 这类规则直接失联，因此一律不推。
     """
     from . import settings
     if not m:
         return
     if settings.get("wan_port_mode") != "stun":
+        return
+    if not exact:
         return
     if m.get("wan_port") == public_port:
         return
@@ -196,6 +209,9 @@ def _reconcile(client):
         if rid not in router:
             continue
         manual = bool(m.get("wan_port_manual"))
+        if stun_mode and not m.get("public_exact", 1):
+            # 跨 IP 探测得到的公网端口不可信，stun 模式下也不拿它去改路由
+            continue
         if stun_mode:
             # 实测公网端口为准：本地记录可能因历史问题落后于实测值
             want = str(int(m.get("public_port") or m["wan_port"] or m["lan_port"]))
@@ -213,7 +229,7 @@ def _reconcile(client):
         r = raw[rid]
         fallback = {
             "lan_addr": (r.get("lan_addr") or "").strip()
-                        or ikuai_client.IKuaiClient._int_to_ip(r.get("lan_addr_int"))
+                        or ikuai_client.int_to_ip(r.get("lan_addr_int"))
                         or m["lan_ip"],
             "lan_port": str(int(r.get("lan_port") or m["lan_port"])),
             "protocol": r.get("protocol") or m["proto"],
@@ -249,7 +265,8 @@ def _resume(client, m):
     preserve 且非手填 → 外网端口 = 内网端口；手填 → 用填的值；stun 模式 → 用实测值。
     """
     from . import settings as _settings
-    if _settings.get("wan_port_mode") == "stun" and m.get("public_port"):
+    if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
+            and m.get("public_exact", 1)):
         wan_port = m["public_port"]
     elif m.get("wan_port_manual") and m.get("wan_port"):
         wan_port = m["wan_port"]
@@ -287,6 +304,8 @@ def _provision_probe(id):
     m = db.get_mapping(id)
     if not m or m["status"] != "active":
         return
+    if not m.get("probe", 1):
+        return
     server = db.get_best_stun_server()
     if not server:
         return
@@ -295,5 +314,6 @@ def _provision_probe(id):
     )
     if ext_port is None:
         return
-    db.update_mapping(id, public_port=ext_port, fail_count=0)
-    _sync_wan_port(ikuai_client.IKuaiClient(), db.get_mapping(id), ext_port)
+    db.update_mapping(id, public_port=ext_port, fail_count=0,
+                      public_exact=1 if exact else 0)
+    _sync_wan_port(ikuai_client.IKuaiClient(), db.get_mapping(id), ext_port, exact)

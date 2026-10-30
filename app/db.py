@@ -74,9 +74,15 @@ def init():
         have_m = {r["name"] for r in c.execute("PRAGMA table_info(mappings)").fetchall()}
         for col, ddl in (("public_port", "INTEGER"),
                          ("public_port_manual", "INTEGER DEFAULT 0"),
+                         # 探测时没能绑定到该映射的内网 IP（跨 IP 探测）则为 0，
+                         # 公网端口是同一端口号在容器视角下的结果，仅供参考
+                         ("public_exact", "INTEGER DEFAULT 1"),
                          # wan_port_manual=1 表示这条映射的外网端口是用户手填的，
                          # 模式切换时不能被自动覆盖
-                         ("wan_port_manual", "INTEGER DEFAULT 0")):
+                         ("wan_port_manual", "INTEGER DEFAULT 0"),
+                         # probe=0：目标机不是容器自己，测到的公网端口属于容器而非目标机，
+                         # 没有意义，因此不轮询探测（省掉每轮 N 次无效 STUN 握手）
+                         ("probe", "INTEGER DEFAULT 1")):
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 
@@ -110,16 +116,16 @@ def get_mapping(id):
 
 
 def create_mapping(name, lan_ip, lan_port, proto, wan_port=None, rule_id=None,
-                   wan_port_manual=0):
+                   wan_port_manual=0, probe=1):
     t = now()
     with _lock:
         c = _conn()
         cur = c.execute(
             """INSERT INTO mappings(name, lan_ip, lan_port, proto, wan_port, rule_id,
-                                    wan_port_manual, status, fail_count, created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?, 'active', 0, ?, ?)""",
+                                    wan_port_manual, probe, status, fail_count, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?, 'active', 0, ?, ?)""",
             (name, lan_ip, int(lan_port), proto, wan_port, rule_id,
-             int(wan_port_manual), t, t),
+             int(wan_port_manual), int(probe), t, t),
         )
         mid = cur.lastrowid
         c.commit()

@@ -31,6 +31,53 @@ class IKuaiError(Exception):
     pass
 
 
+def int_to_ip(n):
+    """爱快 GET 规则时会同时返回 lan_addr（字符串）与 lan_addr_int（整数）。
+    刚创建完 / 部分老规则 lan_addr 可能为空或还没落定，此时用整数还原成点分十进制。
+    直接把整数塞回 PUT 会被爱快判为「参数错误: lan_addr」。"""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return None
+    if not 0 <= n <= 0xFFFFFFFF:
+        return None
+    import socket as _socket
+    import struct as _struct
+    try:
+        return _socket.inet_ntoa(_struct.pack("!I", n))
+    except OSError:
+        return None
+
+
+def parse_port(v):
+    """爱快的端口字段是字符串，可能是单个端口 '80'，也可能是范围 '1000-2000'。
+
+    返回 (端口号 or None, 是否范围)。范围型规则本工具暂不接管。
+    """
+    s = str(v or "").strip()
+    if not s:
+        return None, False
+    if "-" in s or "," in s or " " in s:
+        return None, True
+    try:
+        p = int(s)
+    except ValueError:
+        return None, False
+    return (p, False) if 1 <= p <= 65535 else (None, False)
+
+
+def norm_proto(p):
+    """把爱快的协议写法归一化成本工具支持的 tcp / udp / tcp+udp / any。"""
+    s = str(p or "").strip().lower()
+    if s in ("tcp+udp", "tcpudp", "udp+tcp", "tcp_udp"):
+        return "tcp+udp"
+    if s in ("tcp", "udp"):
+        return s
+    if s in ("any", "all", ""):
+        return "any"
+    return s
+
+
 class IKuaiClient:
     def __init__(self, base_url=None, token=None, interface=None, verify_ssl=None, mock=None):
         # 值一律「现用现取」，这样在 WebUI 改完配置后，已存在的客户端实例立刻生效，
@@ -125,6 +172,52 @@ class IKuaiClient:
             return data["results"].get("data", []) or []
         return data.get("data", []) or []
 
+    def read_rules(self):
+        """读取并解析爱快上现有的 DNAT 规则，供 WebUI 的「发现并导入」使用。
+
+        无法接管的规则（端口范围型、取不到内网地址）会标出 adoptable=False + reason，
+        导入时被跳过，避免接过来之后对账逻辑推错端口。
+        """
+        out = []
+        for r in self.list_dnat() or []:
+            try:
+                rid = int(r.get("id"))
+            except (TypeError, ValueError):
+                continue
+            lan_addr = (r.get("lan_addr") or "").strip()
+            if not lan_addr or lan_addr == "0.0.0.0":
+                lan_addr = int_to_ip(r.get("lan_addr_int")) or ""
+            lan_port, is_range = parse_port(r.get("lan_port"))
+            wan_port, wan_range = parse_port(r.get("wan_port"))
+            raw_lan = str(r.get("lan_port") or "").strip()
+            raw_wan = str(r.get("wan_port") or "").strip()
+            item = {
+                "id": rid,
+                "name": (r.get("tagname") or "").strip() or f"规则{rid}",
+                "interface": r.get("interface") or "",
+                "lan_addr": lan_addr,
+                "lan_port": lan_port,
+                "wan_port": wan_port,
+                "lan_port_raw": raw_lan,
+                "wan_port_raw": raw_wan,
+                "proto": norm_proto(r.get("protocol")),
+                "enabled": str(r.get("enabled") or "yes").strip().lower() == "yes",
+                "comment": r.get("comment") or "",
+                "adoptable": True,
+                "reason": "",
+            }
+            if not lan_addr:
+                item["adoptable"] = False
+                item["reason"] = "取不到内网地址"
+            elif is_range or wan_range:
+                item["adoptable"] = False
+                item["reason"] = f"端口范围（{raw_wan}→{raw_lan}），暂不支持"
+            elif lan_port is None:
+                item["adoptable"] = False
+                item["reason"] = "内网端口无效"
+            out.append(item)
+        return out
+
     def get_dnat(self, rule_id):
         try:
             data = self._req("GET", f"/network/dnat/rules/{rule_id}")
@@ -154,24 +247,6 @@ class IKuaiClient:
             rid = (data.get("data") or {}).get("id")
         return int(rid) if rid is not None else None
 
-    @staticmethod
-    def _int_to_ip(n):
-        """爱快 GET 规则时会同时返回 lan_addr（字符串）与 lan_addr_int（整数）。
-        刚创建完的规则 lan_addr 可能还没落定，此时必须用整数还原成点分十进制，
-        直接把整数塞回 PUT 会被爱快判为「参数错误: lan_addr」。"""
-        try:
-            n = int(n)
-        except (TypeError, ValueError):
-            return None
-        if not (0 <= n <= 0xFFFFFFFF):
-            return None
-        import socket as _socket
-        import struct as _struct
-        try:
-            return _socket.inet_ntoa(_struct.pack("!I", n))
-        except OSError:
-            return None
-
     def update_dnat(self, rule_id, fields, fallback=None):
         """更新 DNAT 规则。爱快 PUT 需传完整字段，因此先取回原规则再合并，保证只改传入字段。
 
@@ -181,7 +256,7 @@ class IKuaiClient:
 
         lan_addr = (cur.get("lan_addr") or "").strip()
         if not lan_addr:
-            lan_addr = self._int_to_ip(cur.get("lan_addr_int")) or ""
+            lan_addr = int_to_ip(cur.get("lan_addr_int")) or ""
         if not lan_addr and fallback:
             lan_addr = fallback.get("lan_addr") or ""
 

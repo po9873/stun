@@ -98,6 +98,30 @@
     </div>
 
     <div class="card">
+      <h3>从爱快导入已有规则</h3>
+      <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <button class="btn primary" onclick="discover()">扫描爱快上的规则</button>
+        <button class="btn" onclick="importSelected()">接管选中</button>
+        <button class="btn" onclick="importAll()">一键全部接管</button>
+        <span id="dis_msg" class="muted"></span>
+      </div>
+      <p class="muted" style="margin:0 0 10px">
+        把路由上已有的 DNAT 规则直接登记进来，<b>不会改动路由上的任何设置</b>，
+        也不会删掉重建——沿用原有的规则 ID、内网地址和外网端口。
+        接管后可统一管理、纳入自动对账；
+        只有目标机就是容器自己时才会顺带测出公网访问地址。
+      </p>
+      <table>
+        <thead><tr>
+          <th style="width:30px"><input type="checkbox" id="dis_all" onchange="toggleAll(this.checked)"/></th>
+          <th>规则ID</th><th>名称</th><th>内网 IP:端口</th><th>协议</th>
+          <th>外网端口</th><th>爱快状态</th><th>接管情况</th>
+        </tr></thead>
+        <tbody id="dis_body"></tbody>
+      </table>
+    </div>
+
+    <div class="card">
       <h3>当前映射</h3>
       <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn" onclick="reconcile()">立即与爱快对账</button>
@@ -116,6 +140,10 @@
         默认应与内网端口一致。若不一致，该行标红显示「未同步」，每 5 分钟自动推一次，
         也可点上方按钮立即对账。
         「公网访问地址」由 STUN 实测得出，是发给别人访问用的地址。
+        显示 <b>不可测</b> 的表示目标机不是容器自己 —— 容器绑不到它的内网 IP，
+        测出来的是容器自己那条 CGNAT 映射，与目标机无关（CGNAT 会给不同内网 IP
+        分配不同公网端口），所以不做无谓探测，也不会拿它去改路由。
+        想要某个服务的真实公网端口，只能由那台机器自己发出连接。
       </p>
     </div>
   </section>
@@ -258,7 +286,12 @@ async function loadMappings(){
     const tr = document.createElement("tr");
     if(m.status==="suspended") tr.className="suspended";
     const dot = m.status==="active"?"s-active":"s-suspended";
-    const addr = (EXT_IP && m.public_port) ? `${EXT_IP}:${m.public_port}` : (m.public_port?`:${m.public_port}`:"—");
+    // 目标机不是容器自己 → 绑不到它的内网 IP，测出来的是容器自己的映射，没有意义
+    const noprobe = m.probe === 0;
+    const addr = noprobe
+      ? '<span class="muted" title="目标机不是容器自身，容器测到的是自己那条 CGNAT 映射，与目标机无关">不可测</span>'
+      : ((EXT_IP && m.public_port) ? `${EXT_IP}:${m.public_port}`
+                                   : (m.public_port ? `:${m.public_port}` : "—"));
     // 爱快上真实生效的外网端口（对账读回）；与本地不一致时标红提示
     const live = m.rule_id ? (ROUTER[String(m.rule_id)] || null) : null;
     const want = String(m.wan_port || m.lan_port);
@@ -277,7 +310,7 @@ async function loadMappings(){
       <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?" <span class='badge' style='background:#c0392b;color:#fff'>未同步</span>":""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
-        <button class="btn small danger" onclick="del(${m.id})">删除</button>
+        <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
   });
@@ -312,9 +345,89 @@ async function addMapping(){
   if(r.ok){ $("m_name").value="";$("m_ip").value="";$("m_port").value="";$("m_wan").value=""; refresh(); }
   else alert("添加失败："+(await r.text()));
 }
-async function del(id){ if(!confirm("删除该映射并同步删除爱快规则？"))return; await fetch("/api/mappings/"+id,{method:"DELETE"}); refresh(); }
+// 这里的 id 是本地映射 ID（不是爱快规则 ID），确认框必须点名，避免删错
+async function del(id, name){
+  const row = (await (await fetch("/api/mappings")).json()).find(m=>m.id===id);
+  const rid = row ? row.rule_id : "?";
+  if(!confirm(`确定删除映射「${name}」？\n同时会删除它在爱快上的 DNAT 规则（规则ID ${rid}）。`)) return;
+  await fetch("/api/mappings/"+id,{method:"DELETE"}); refresh();
+}
 async function resume(id){ await fetch("/api/mappings/"+id+"/resume",{method:"POST"}); refresh(); }
 async function reconcile(){ await fetch("/api/mappings/reconcile",{method:"POST"}); refresh(); }
+
+/* ---------------- 从爱快发现 / 接管 ---------------- */
+let DISCOVERED = [];
+async function discover(){
+  const el = $("dis_msg");
+  el.style.color = "var(--muted)"; el.textContent = "正在读取爱快规则…";
+  const j = await (await fetch("/api/ikuai/rules")).json();
+  if(!j.ok){
+    el.style.color = "var(--red)";
+    el.textContent = "✗ 读取失败：" + j.error;
+    DISCOVERED = []; renderDiscover(); return;
+  }
+  DISCOVERED = j.rules;
+  const free = j.rules.filter(r=>!r.taken && r.adoptable).length;
+  el.style.color = free ? "var(--green)" : "var(--muted)";
+  el.textContent = `✓ 共 ${j.rules.length} 条，其中 ${free} 条可接管`;
+  renderDiscover();
+}
+function renderDiscover(){
+  const tb = $("dis_body"); tb.innerHTML = "";
+  if(!DISCOVERED.length){
+    tb.innerHTML = '<tr><td colspan="8" class="muted">点上方「扫描爱快上的规则」读取路由现有 DNAT 规则</td></tr>';
+    $("dis_all").checked = false;
+    return;
+  }
+  DISCOVERED.forEach(r=>{
+    const tr = document.createElement("tr");
+    const pick = r.taken || !r.adoptable;
+    let state;
+    if(r.taken) state = '<span class="badge">已接管</span>';
+    else if(!r.adoptable) state = `<span class="badge" style="background:#c0392b;color:#fff">不可接管</span> <span class="muted">${r.reason}</span>`;
+    else state = '<span class="badge" style="background:#1d4ed8;color:#fff">待接管</span>';
+    tr.innerHTML = `
+      <td><input type="checkbox" class="dis_pick" data-id="${r.id}" ${pick?"disabled":""}/></td>
+      <td>${r.id}</td>
+      <td>${r.name}</td>
+      <td>${r.lan_addr}:${r.lan_port_raw || r.lan_port}</td>
+      <td><span class="badge">${r.proto}</span></td>
+      <td>${r.wan_port_raw || r.wan_port}</td>
+      <td>${r.enabled ? '<span class="status-dot s-active"></span>启用' : '<span class="status-dot s-suspended"></span>禁用'}</td>
+      <td>${state}</td>`;
+    tb.appendChild(tr);
+  });
+}
+function toggleAll(on){
+  document.querySelectorAll(".dis_pick").forEach(c=>{ if(!c.disabled) c.checked = on; });
+}
+async function importIds(ids){
+  if(!ids.length){ alert("没有可接管的规则"); return; }
+  const el = $("dis_msg");
+  el.style.color = "var(--muted)"; el.textContent = `正在接管 ${ids.length} 条…`;
+  const r = await fetch("/api/ikuai/import",{method:"POST",
+    headers:{"Content-Type":"application/json"},body:JSON.stringify({ids})});
+  const j = await r.json();
+  if(!r.ok){
+    el.style.color = "var(--red)";
+    el.textContent = "✗ " + (j.detail || "接管失败");
+    return;
+  }
+  const sk = (j.skipped||[]).map(s=>`${s.id}(${s.reason})`).join("、");
+  el.style.color = j.imported ? "var(--green)" : "var(--red)";
+  el.textContent = `✓ 接管 ${j.imported} 条` + (sk ? `，跳过：${sk}` : "");
+  await discover(); refresh();
+}
+async function importSelected(){
+  const ids = [...document.querySelectorAll(".dis_pick")].filter(c=>c.checked).map(c=>Number(c.dataset.id));
+  await importIds(ids);
+}
+async function importAll(){
+  const ids = DISCOVERED.filter(r=>!r.taken && r.adoptable).map(r=>r.id);
+  if(!ids.length){ alert("爱快上没有可接管的新规则"); return; }
+  if(!confirm(`将接管爱快上 ${ids.length} 条规则（不会改动路由设置），继续？`)) return;
+  await importIds(ids);
+}
 
 async function scanStun(){ const b=$("alert"); b.style.display="none"; await fetch("/api/stun/scan",{method:"POST"}); loadStun(); loadStatus(); }
 async function refreshPool(){

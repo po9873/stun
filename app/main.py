@@ -3,6 +3,7 @@
 启动钩子：初始化数据库、种入预置 STUN 服务器、启动后台轮询线程。
 """
 import logging
+import socket
 import threading
 from pathlib import Path
 from typing import Optional
@@ -37,6 +38,10 @@ class StunIn(BaseModel):
     nat_capable: int = 0
 
 
+class ImportIn(BaseModel):
+    ids: list = []          # 要接管的爱快规则 ID
+
+
 class SettingsIn(BaseModel):
     ikuai_base_url: Optional[str] = None
     ikuai_token: Optional[str] = None      # 留空 = 沿用已保存的令牌
@@ -44,6 +49,32 @@ class SettingsIn(BaseModel):
     ikuai_verify_ssl: Optional[bool] = None
     wan_port_mode: Optional[str] = None    # stun | preserve
     stun_pool_url: Optional[str] = None
+
+
+def local_ips():
+    """容器自己持有的 IPv4 地址集合。
+
+    STUN 探测只能绑定到容器自己的地址。若映射的目标机是别的 IP，容器根本绑不上去，
+    测出来的公网端口是容器那条 CGNAT 映射，与目标机无关 —— 这种就没必要探测。
+    """
+    ips = set()
+    try:
+        hostname = socket.gethostname()
+        for info in socket.getaddrinfo(hostname, None, socket.AF_INET):
+            ips.add(info[4][0])
+    except OSError:
+        pass
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("223.5.5.5", 80))       # 只借路由表推出出口 IP，不发包
+            ips.add(s.getsockname()[0])
+        finally:
+            s.close()
+    except OSError:
+        pass
+    ips.discard("127.0.0.1")
+    return ips
 
 
 # ---------------- 启动 ----------------
@@ -166,9 +197,12 @@ def api_create_mapping(req: MappingIn):
     # 用户手填了才记 manual=1，这样切模式时不会被自动覆盖。
     manual = 1 if req.wan_port else 0
     wan_port = int(req.wan_port or req.lan_port)
+    # 目标机不是容器自己时无法绑定源地址，探测结果无意义，直接不探测
+    can_probe = req.lan_ip in local_ips()
     m = db.create_mapping(
         name=req.name, lan_ip=req.lan_ip, lan_port=req.lan_port,
         proto=req.proto, wan_port=wan_port, wan_port_manual=manual,
+        probe=1 if can_probe else 0,
     )
     client = ikuai_client.IKuaiClient()
     try:
@@ -187,8 +221,12 @@ def api_create_mapping(req: MappingIn):
     m = db.get_mapping(m["id"])
     log.info(f"新增映射 [{m['name']}] {m['lan_ip']}:{m['lan_port']} "
              f"爱快侧端口={m['wan_port']} 规则ID={m['rule_id']}")
-    # 后台即时探测一次，刷新「公网侧端口」（仅用于展示访问地址，不写回爱快）
-    threading.Thread(target=poller._provision_probe, args=(m["id"],), daemon=True).start()
+    if not can_probe:
+        log.warning(f"[{m['name']}] 目标机 {req.lan_ip} 不是容器自身，"
+                    f"无法绑定源地址，跳过 STUN 探测（公网访问地址不可用）")
+    else:
+        # 后台即时探测一次，刷新「公网侧端口」（仅用于展示访问地址，不写回爱快）
+        threading.Thread(target=poller._provision_probe, args=(m["id"],), daemon=True).start()
     return m
 
 
@@ -214,6 +252,83 @@ def api_resume_mapping(mid: int):
         raise HTTPException(404, "映射不存在")
     log.info(f"手动恢复映射 [{m['name']}]")
     return m
+
+
+# ---------------- 从爱快发现 / 接管已有规则 ----------------
+@app.get("/api/ikuai/rules")
+def api_ikuai_rules():
+    """列出爱快上现有的 DNAT 规则，并标出哪些已经被本工具接管。"""
+    try:
+        rules = ikuai_client.IKuaiClient().read_rules()
+    except Exception as e:
+        log.error(f"读取爱快规则失败: {e}")
+        return {"ok": False, "error": str(e), "rules": []}
+    taken = {m["rule_id"] for m in db.list_mappings() if m.get("rule_id")}
+    for r in rules:
+        r["taken"] = r["id"] in taken
+    return {"ok": True, "error": None, "rules": rules}
+
+
+@app.post("/api/ikuai/import")
+def api_ikuai_import(req: ImportIn):
+    """接管爱快上已有的规则：只在本地登记，不改动路由上的任何设置。
+
+    - 沿用爱快现有的内网地址/端口与外网端口，外网端口记为「用户手填」，
+      这样切换端口模式时不会被自动改写。
+    - 爱快上已禁用的规则接管为 suspended，对账不会去碰它。
+    """
+    ids = [int(i) for i in (req.ids or [])]
+    if not ids:
+        return {"imported": 0, "skipped": [], "mappings": db.list_mappings()}
+    try:
+        rules = {r["id"]: r for r in ikuai_client.IKuaiClient().read_rules()}
+    except Exception as e:
+        log.error(f"导入失败，无法读取爱快规则: {e}")
+        raise HTTPException(502, f"读取爱快规则失败: {e}")
+
+    have_rule = {m["rule_id"] for m in db.list_mappings() if m.get("rule_id")}
+    have_key = {(m["lan_ip"], int(m["lan_port"]), m["proto"])
+                for m in db.list_mappings()}
+
+    imported, skipped = 0, []
+    mine = local_ips()
+    for rid in ids:
+        r = rules.get(rid)
+        if not r:
+            skipped.append({"id": rid, "reason": "爱快上已不存在"})
+            continue
+        if not r["adoptable"]:
+            skipped.append({"id": rid, "reason": r["reason"] or "不支持接管"})
+            continue
+        if rid in have_rule:
+            skipped.append({"id": rid, "reason": "已接管"})
+            continue
+        if (r["lan_addr"], r["lan_port"], r["proto"]) in have_key:
+            skipped.append({"id": rid, "reason": "本地已有相同内网地址+端口的映射"})
+            continue
+        # 目标机不是容器自己时测不出有意义的公网端口，直接不探测
+        can_probe = r["lan_addr"] in mine
+        m = db.create_mapping(
+            name=r["name"], lan_ip=r["lan_addr"], lan_port=r["lan_port"],
+            proto=r["proto"], wan_port=r["wan_port"] or r["lan_port"],
+            rule_id=rid, wan_port_manual=1, probe=1 if can_probe else 0,
+        )
+        if not r["enabled"]:
+            db.update_mapping(m["id"], status="suspended",
+                              note="接管时该规则在爱快上是禁用状态")
+        have_rule.add(rid)
+        have_key.add((r["lan_addr"], r["lan_port"], r["proto"]))
+        imported += 1
+        log.info(f"接管爱快规则 {rid} [{r['name']}] {r['lan_addr']}:{r['lan_port']} "
+                 f"外网端口={r['wan_port']}"
+                 + ("" if can_probe else "（非本机，不探测公网端口）"))
+        if can_probe:
+            # 后台即时探测一次，把「公网访问地址」测出来
+            threading.Thread(target=poller._provision_probe,
+                             args=(m["id"],), daemon=True).start()
+    if imported:
+        log.info(f"从爱快导入完成：接管 {imported} 条，跳过 {len(skipped)} 条")
+    return {"imported": imported, "skipped": skipped, "mappings": db.list_mappings()}
 
 
 # ---------------- STUN 服务器 ----------------
