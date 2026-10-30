@@ -100,7 +100,9 @@ def init():
                          ("client_url", "TEXT"),
                          ("client_user", "TEXT"),
                          ("client_pass", "TEXT"),
-                         ("client_port", "INTEGER")):  # 已下发到客户端的端口
+                         ("client_port", "INTEGER"),   # 已下发到客户端的端口
+                         # 非 QB/TR 的客户端：自己写一条命令改端口（{port} 是新公网端口）
+                         ("client_cmd", "TEXT")):
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 

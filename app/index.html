@@ -121,6 +121,7 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
       <h3>从爱快导入已有规则</h3>
       <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn primary" onclick="discover()">扫描爱快上的规则</button>
+        <button class="btn" onclick="discoverAllClients()">自动发现所有客户端</button>
         <button class="btn" onclick="importSelected()">接管选中</button>
         <button class="btn" onclick="importAll()">一键全部接管</button>
         <span id="dis_msg" class="muted"></span>
@@ -354,12 +355,15 @@ async function loadMappings(){
         <option value="1"${m.punch?" selected":""}>开</option></select></div>
       <div><label>客户端</label><select id="pc_kind_${m.id}">
         <option value="qb"${(m.client_kind||"qb")==="qb"?" selected":""}>qBittorrent</option>
-        <option value="tr"${m.client_kind==="tr"?" selected":""}>Transmission</option></select></div>
+        <option value="tr"${m.client_kind==="tr"?" selected":""}>Transmission</option>
+        <option value="other"${m.client_kind==="other"?" selected":""}>其他(自定义命令)</option></select></div>
       <div><label>地址</label><input id="pc_url_${m.id}" style="width:220px" placeholder="http://192.168.6.12:8086" value="${m.client_url||""}"/></div>
+      <div><label>自定义命令</label><input id="pc_cmd_${m.id}" style="width:300px" placeholder="例：ssh root@{ip} 'sed -i ...' 可用 {ip}{port}{lan_port}" value="${m.client_cmd||""}"/></div>
       <div><label>用户名</label><input id="pc_user_${m.id}" style="width:110px" value="${m.client_user||""}"/></div>
       <div><label>密码</label><input id="pc_pass_${m.id}" type="password" style="width:110px" value="${m.client_pass||""}"/></div>
       <div><button class="btn primary" onclick="savePunch(${m.id})">保存</button>
         <button class="btn small" onclick="testPunch(${m.id})">测试</button>
+        <button class="btn small" onclick="autoDisc(${m.id})">自动发现</button>
         <span class="muted" id="pc_msg_${m.id}"></span></div>
     </div></td>`;
     tb.appendChild(pr);
@@ -371,10 +375,12 @@ function togglePunch(id){
   if(el) el.style.display = (el.style.display === "none") ? "" : "none";
 }
 async function savePunch(id){
+  const kind = document.getElementById("pc_kind_" + id).value;
   const body = {
     punch: Number(document.getElementById("pc_on_" + id).value),
-    client_kind: document.getElementById("pc_kind_" + id).value,
-    client_url: document.getElementById("pc_url_" + id).value.trim(),
+    client_kind: kind,
+    client_url: kind === "other" ? "" : document.getElementById("pc_url_" + id).value.trim(),
+    client_cmd: kind === "other" ? document.getElementById("pc_cmd_" + id).value.trim() : "",
     client_user: document.getElementById("pc_user_" + id).value,
     client_pass: document.getElementById("pc_pass_" + id).value,
   };
@@ -390,6 +396,21 @@ async function testPunch(id){
   try{
     const r = await (await fetch("/api/mappings/" + id + "/client/test", {method:"POST"})).json();
     msg.textContent = r.ok ? ("通，当前监听端口 " + r.port) : ("连不上：" + r.error);
+  }catch(e){ msg.textContent = "请求失败：" + e; }
+}
+async function autoDisc(id){
+  const msg = document.getElementById("pc_msg_" + id);
+  msg.textContent = "扫描中…";
+  try{
+    const r = await (await fetch("/api/mappings/" + id + "/discover", {method:"POST"})).json();
+    if(r.ok){
+      msg.textContent = "✓ " + r.msg;
+      document.getElementById("pc_kind_" + id).value = r.mapping.client_kind;
+      document.getElementById("pc_url_" + id).value = r.mapping.client_url || "";
+      setTimeout(refresh, 1200);
+    } else {
+      msg.textContent = "✗ " + r.msg;
+    }
   }catch(e){ msg.textContent = "请求失败：" + e; }
 }
 
@@ -488,6 +509,19 @@ async function bulkAdd(){
 }
 
 /* ---------------- 从爱快发现 / 接管 ---------------- */
+async function discoverAllClients(){
+  const el = $("dis_msg");
+  el.style.color = "var(--muted)"; el.textContent = "正在自动发现…";
+  try{
+    const j = await (await fetch("/api/discover",{method:"POST"})).json();
+    const ok = (j.results||[]).filter(r=>r.ok).length;
+    const bad = (j.results||[]).filter(r=>!r.ok);
+    el.style.color = ok ? "var(--green)" : "var(--red)";
+    el.textContent = "✓ 发现 " + ok + " 条"
+      + (bad.length ? "，未发现：" + bad.map(r=>r.name).join("、") : "");
+    setTimeout(refresh, 1000);
+  }catch(e){ el.style.color="var(--red)"; el.textContent = "失败：" + e; }
+}
 let DISCOVERED = [];
 async function discover(){
   const el = $("dis_msg");

@@ -247,10 +247,31 @@ def _sync_punch(client, m, force=False):
         return
     if not force and m.get("client_port") == want:
         return
+    # 客户端没配好就先自动发现；发现不到才跳过（避免「开了穿透不生效」）
+    if not (m.get("client_url") or m.get("client_cmd")):
+        from . import discovery
+        ok, _msg = discovery.discover_for_mapping(m)
+        if ok:
+            m = db.get_mapping(m["id"])
+            log.info(f"[{m['name']}] 周期自动发现客户端：{_msg}")
+        else:
+            log.warning(f"[{m['name']}] 开了穿透但自动发现客户端失败：{_msg}")
+            return
+    lan = int(m["lan_port"])
+    # 顺序：先把客户端监听端口改成公网端口；成功后再改爱快内部端口。
+    # 客户端改不动（如 TR 缺账号）就不动爱快，避免「爱快改了客户端没改」的断流。
+    try:
+        if m.get("client_cmd"):
+            client_ctl.run_cmd(m, want)          # 通用：任何客户端都靠这条命令
+        else:
+            client_ctl.set_port(m, want)         # 内置适配：QB / TR
+    except Exception as e:
+        log.error(f"[{m['name']}] 穿透：下发客户端监听端口失败（未改动爱快）: {e}")
+        return
     if m.get("rule_id"):
         fallback = {
             "lan_addr": m["lan_ip"],
-            "lan_port": str(int(m["lan_port"])),
+            "lan_port": str(lan),
             "protocol": m["proto"],
             "interface": client.interface,
             "tagname": m["name"],
@@ -259,13 +280,16 @@ def _sync_punch(client, m, force=False):
             client.update_dnat(m["rule_id"], {"lan_port": str(want)},
                                fallback=fallback)
         except Exception as e:
-            log.error(f"[{m['name']}] 穿透：改爱快内部端口失败: {e}")
+            log.error(f"[{m['name']}] 穿透：改爱快内部端口失败，回滚客户端: {e}")
+            # 客户端已经改成公网端口，但爱快没转发 → 回滚客户端，避免断流
+            try:
+                if m.get("client_cmd"):
+                    client_ctl.run_cmd(m, lan)
+                else:
+                    client_ctl.set_port(m, lan)
+            except Exception:
+                pass
             return
-    try:
-        client_ctl.set_port(m, want)
-    except Exception as e:
-        log.error(f"[{m['name']}] 穿透：下发客户端监听端口失败: {e}")
-        return
     db.update_mapping(m["id"], client_port=want)
     log.info(f"[{m['name']}] 穿透端口 {want} 已同步（爱快内部端口 + 客户端监听端口）")
 
@@ -281,9 +305,12 @@ def restore_punch(client, m):
             client.update_dnat(m["rule_id"], {"lan_port": str(want)})
         except Exception as e:
             log.error(f"[{m['name']}] 还原爱快内部端口失败: {e}")
-    if m.get("client_url"):
+    if m.get("client_url") or m.get("client_cmd"):
         try:
-            client_ctl.set_port(m, want)
+            if m.get("client_cmd"):
+                client_ctl.run_cmd(m, want)
+            else:
+                client_ctl.set_port(m, want)
         except Exception as e:
             log.error(f"[{m['name']}] 还原客户端端口失败: {e}")
     db.update_mapping(m["id"], punch=0, client_port=want)

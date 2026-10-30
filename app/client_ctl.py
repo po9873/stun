@@ -30,8 +30,13 @@ def _base(m):
 
 
 def _auth(m):
+    """这条映射自己的账号优先，没有就用设置页里填的全局默认账号。"""
+    from . import settings
     u = (m.get("client_user") or "").strip()
     p = m.get("client_pass") or ""
+    if not u:
+        u = (settings.get("client_user") or "").strip()
+        p = settings.get("client_pass") or ""
     return (u, p) if u else None
 
 
@@ -112,6 +117,27 @@ def get_port(m):
 def set_port(m, port):
     kind = (m.get("client_kind") or "qb").lower()
     return tr_set_port(m, port) if kind == "tr" else qb_set_port(m, port)
+
+
+def run_cmd(m, port):
+    """通用兜底：任何客户端（不是 QB/TR 也能接）自己写一条命令改端口。
+
+    占位符：{ip} 内网地址、{port} 新的公网端口、{lan_port} 打洞端口、{name} 名称。
+    例：ssh root@{ip} "sed -i s/peer-port.*/peer-port={port}/ /cfg.json && restart bt"
+    """
+    import subprocess
+    cmd = (m.get("client_cmd") or "").strip()
+    if not cmd:
+        return True
+    s = (cmd.replace("{ip}", m["lan_ip"])
+            .replace("{port}", str(int(port)))
+            .replace("{lan_port}", str(int(m["lan_port"])))
+            .replace("{name}", m["name"]))
+    r = subprocess.run(s, shell=True, capture_output=True, timeout=25)
+    if r.returncode != 0:
+        raise ClientError(
+            f"命令退出 {r.returncode}: {(r.stderr or b'').decode('utf-8', 'replace')[:150]}")
+    return True
 
 
 def test(m):

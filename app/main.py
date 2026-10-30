@@ -48,6 +48,7 @@ class MappingPatch(BaseModel):
     client_url: Optional[str] = None
     client_user: Optional[str] = None
     client_pass: Optional[str] = None
+    client_cmd: Optional[str] = None
 
 
 class StunIn(BaseModel):
@@ -328,6 +329,13 @@ def _punch_now(mid):
         if not m.get("punch"):
             poller.restore_punch(ikuai_client.IKuaiClient(), m)
             return
+        # 开了穿透但没配客户端（地址/命令）→ 先自动去 lan_ip 上发现
+        if not (m.get("client_url") or m.get("client_cmd")):
+            from . import discovery
+            ok, _msg = discovery.discover_for_mapping(m)
+            if ok:
+                m = db.get_mapping(mid)
+                log.info(f"[{m['name']}] 开穿透自动发现客户端：{_msg}")
         ext_ip, ext_port, exact = stun_probe.probe_mapping_port(
             m["lan_ip"], m["lan_port"], proto=m["proto"])
         if ext_port:
@@ -339,16 +347,17 @@ def _punch_now(mid):
 
 @app.put("/api/mappings/{mid}")
 def api_patch_mapping(mid: int, req: MappingPatch):
-    """改穿透设置（名称、内网地址端口不动）。"""
+    """改穿透设置（名称、内网地址端口不动）。
+
+    开穿透不强制手填客户端地址：没填的话后台会自动去 lan_ip 上发现；
+    发现不到才告警，不会把穿透置成「填了不生效」。
+    """
     m = db.get_mapping(mid)
     if not m:
         raise HTTPException(404, "映射不存在")
     fields = {k: v for k, v in req.dict(exclude_none=True).items()}
     if not fields:
         return m
-    url = fields.get("client_url", m.get("client_url"))
-    if fields.get("punch") is not None and int(fields["punch"]) == 1 and not url:
-        raise HTTPException(400, "开穿透要先填客户端地址")
     db.update_mapping(mid, **fields)
     log.info(f"[{m['name']}] 穿透设置已保存：{fields}")
     threading.Thread(target=_punch_now, args=(mid,), daemon=True).start()
@@ -365,6 +374,29 @@ def api_test_client(mid: int):
         return {"ok": True, "port": client_ctl.test(m)}
     except Exception as e:
         return {"ok": False, "error": str(e)}
+
+
+@app.post("/api/mappings/{mid}/discover")
+def api_discover_client(mid: int):
+    """自动发现这条映射的 BT 客户端（扫 lan_ip 端口 + 识别 QB/TR），写回地址。
+
+    找不到就报原因；找到但需账号，会先写地址、提示补账号。
+    """
+    m = db.get_mapping(mid)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    from . import discovery
+    ok, msg = discovery.discover_for_mapping(m)
+    if ok:
+        return {"ok": True, "msg": msg, "mapping": db.get_mapping(mid)}
+    return {"ok": False, "msg": msg}
+
+
+@app.post("/api/discover")
+def api_discover_all():
+    """批量自动发现所有还没配客户端的映射。"""
+    from . import discovery
+    return {"results": discovery.discover_all(only_missing=True)}
 
 
 _IP_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})$")
