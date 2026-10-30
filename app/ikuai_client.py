@@ -219,14 +219,21 @@ class IKuaiClient:
         return out
 
     def get_dnat(self, rule_id):
+        """取单条规则。爱快按 ID 查有时返回空壳（字段不全），
+        那就退回列表里捞 —— PUT 必须带完整字段，缺 wan_port 会被判「参数错误」。
+        """
+        raw = {}
         try:
             data = self._req("GET", f"/network/dnat/rules/{rule_id}")
-            return data.get("data") or data.get("results") or {}
+            raw = data.get("data") or data.get("results") or {}
         except IKuaiError:
-            for r in self.list_dnat():
-                if str(r.get("id")) == str(rule_id):
-                    return r
-            return {}
+            raw = {}
+        if isinstance(raw, dict) and str(raw.get("wan_port") or "").strip():
+            return raw
+        for r in self.list_dnat():
+            if str(r.get("id")) == str(rule_id):
+                return r
+        return raw if isinstance(raw, dict) else {}
 
     def rule_fields(self, m):
         """这条映射在爱快上应该长什么样：一条普普通通的端口映射。
@@ -286,12 +293,18 @@ class IKuaiClient:
         if not isinstance(src, dict):
             src = {"custom": [], "object": []}
 
+        wan_port = cur.get("wan_port")
+        if wan_port in (None, ""):
+            wan_port = (fallback or {}).get("wan_port")
+        if wan_port in (None, ""):
+            wan_port = lan_port          # 拿不到就按端口保留处理，别把空值塞给爱快
+
         tag = cur.get("tagname") or (fallback or {}).get("tagname") or ""
         body = {
             "tagname": tag,
             "lan_addr": lan_addr,
             "lan_port": lan_port,
-            "wan_port": cur.get("wan_port"),
+            "wan_port": wan_port,
             "protocol": protocol,
             "interface": interface,
             "enabled": cur.get("enabled") or "yes",

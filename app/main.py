@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import (config, db, ikuai_client, logbuf, notifier, poller,
+from . import (client_ctl, config, db, ikuai_client, logbuf, notifier, poller,
                settings, state, stun_probe)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -34,6 +34,20 @@ class MappingIn(BaseModel):
     lan_port: int
     proto: str = "tcp"          # tcp / udp / tcp+udp / any
     wan_port: Optional[int] = None
+    punch: Optional[int] = 0            # 1=穿透模式（公网端口写回客户端）
+    client_kind: Optional[str] = None   # qb / tr
+    client_url: Optional[str] = None    # http://192.168.6.12:8086
+    client_user: Optional[str] = None
+    client_pass: Optional[str] = None
+
+
+class MappingPatch(BaseModel):
+    """只改穿透那一组字段（名称/内网地址端口不动）。"""
+    punch: Optional[int] = None
+    client_kind: Optional[str] = None
+    client_url: Optional[str] = None
+    client_user: Optional[str] = None
+    client_pass: Optional[str] = None
 
 
 class StunIn(BaseModel):
@@ -273,6 +287,9 @@ def api_create_mapping(req: MappingIn):
         name=req.name, lan_ip=req.lan_ip, lan_port=req.lan_port,
         proto=req.proto, wan_port=wan_port, wan_port_manual=manual,
         probe=1 if can_probe else 0,
+        punch=req.punch or 0, client_kind=req.client_kind,
+        client_url=req.client_url, client_user=req.client_user,
+        client_pass=req.client_pass,
     )
     client = ikuai_client.IKuaiClient()
     try:
@@ -300,6 +317,54 @@ def api_create_mapping(req: MappingIn):
         # 后台即时探测一次，刷新「公网侧端口」（仅用于展示访问地址，不写回爱快）
         threading.Thread(target=poller._provision_probe, args=(m["id"],), daemon=True).start()
     return m
+
+
+def _punch_now(mid):
+    """开/关穿透后立刻生效：先问一次公网端口，再同步到爱快与客户端。"""
+    try:
+        m = db.get_mapping(mid)
+        if not m or m["status"] != "active":
+            return
+        if not m.get("punch"):
+            poller.restore_punch(ikuai_client.IKuaiClient(), m)
+            return
+        ext_ip, ext_port, exact = stun_probe.probe_mapping_port(
+            m["lan_ip"], m["lan_port"], proto=m["proto"])
+        if ext_port:
+            db.update_mapping(mid, public_port=ext_port, public_exact=1)
+        poller._sync_punch(ikuai_client.IKuaiClient(), db.get_mapping(mid), force=True)
+    except Exception as e:
+        log.error(f"穿透同步失败: {e}")
+
+
+@app.put("/api/mappings/{mid}")
+def api_patch_mapping(mid: int, req: MappingPatch):
+    """改穿透设置（名称、内网地址端口不动）。"""
+    m = db.get_mapping(mid)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    fields = {k: v for k, v in req.dict(exclude_none=True).items()}
+    if not fields:
+        return m
+    url = fields.get("client_url", m.get("client_url"))
+    if fields.get("punch") is not None and int(fields["punch"]) == 1 and not url:
+        raise HTTPException(400, "开穿透要先填客户端地址")
+    db.update_mapping(mid, **fields)
+    log.info(f"[{m['name']}] 穿透设置已保存：{fields}")
+    threading.Thread(target=_punch_now, args=(mid,), daemon=True).start()
+    return db.get_mapping(mid)
+
+
+@app.post("/api/mappings/{mid}/client/test")
+def api_test_client(mid: int):
+    """测一下客户端地址/账号对不对，返回它当前的监听端口。"""
+    m = db.get_mapping(mid)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    try:
+        return {"ok": True, "port": client_ctl.test(m)}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 
 _IP_RE = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})$")

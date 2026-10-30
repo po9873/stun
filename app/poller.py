@@ -147,6 +147,9 @@ def _poll_mappings(client):
             pass
         # 每轮都对齐一次，这样切模式/重启后能自动纠正不一致
         _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, True)
+    for m in targets:
+        # 穿透模式：公网端口变了（或还没下发过）就同步到爱快内部端口与客户端
+        _sync_punch(client, db.get_mapping(m["id"]))
 
     # 删掉/挂起的映射，收回它保持住的那条连接
     stun_probe.prune_conns(
@@ -229,6 +232,63 @@ def _sync_wan_port(client, m, public_port, exact=True):
     db.update_mapping(m["id"], wan_port=public_port)
 
 
+def _sync_punch(client, m, force=False):
+    """穿透模式：把实测公网端口写进爱快「内部端口」，并下发成 BT 客户端的监听端口。
+
+    爱快的外网端口保持 = 内网端口（打洞端口），容器一直从它发包维持 CGNAT 映射；
+    内部端口 + 客户端监听端口 = 公网端口，于是客户端对外通告的就是公网端口，
+    外部连 公网IP:公网端口 → CGNAT → 100.x:打洞端口 → 爱快 DNAT → 内网机:公网端口。
+    """
+    from . import client_ctl
+    if not m or not m.get("punch"):
+        return
+    want = int(m.get("public_port") or 0)
+    if not want:
+        return
+    if not force and m.get("client_port") == want:
+        return
+    if m.get("rule_id"):
+        fallback = {
+            "lan_addr": m["lan_ip"],
+            "lan_port": str(int(m["lan_port"])),
+            "protocol": m["proto"],
+            "interface": client.interface,
+            "tagname": m["name"],
+        }
+        try:
+            client.update_dnat(m["rule_id"], {"lan_port": str(want)},
+                               fallback=fallback)
+        except Exception as e:
+            log.error(f"[{m['name']}] 穿透：改爱快内部端口失败: {e}")
+            return
+    try:
+        client_ctl.set_port(m, want)
+    except Exception as e:
+        log.error(f"[{m['name']}] 穿透：下发客户端监听端口失败: {e}")
+        return
+    db.update_mapping(m["id"], client_port=want)
+    log.info(f"[{m['name']}] 穿透端口 {want} 已同步（爱快内部端口 + 客户端监听端口）")
+
+
+def restore_punch(client, m):
+    """关掉穿透：爱快内部端口与客户端监听端口都还原成内网端口。"""
+    from . import client_ctl
+    if not m:
+        return
+    want = int(m["lan_port"])
+    if m.get("rule_id"):
+        try:
+            client.update_dnat(m["rule_id"], {"lan_port": str(want)})
+        except Exception as e:
+            log.error(f"[{m['name']}] 还原爱快内部端口失败: {e}")
+    if m.get("client_url"):
+        try:
+            client_ctl.set_port(m, want)
+        except Exception as e:
+            log.error(f"[{m['name']}] 还原客户端端口失败: {e}")
+    db.update_mapping(m["id"], punch=0, client_port=want)
+
+
 def _reconcile(client):
     """与爱快对账：拿路由上的真实规则，发现 wan_port 不一致就推回去。
 
@@ -278,6 +338,28 @@ def _reconcile(client):
         # 本地记录跟模式不一致时，先纠正本地，再和路由比对
         if m.get("wan_port") != int(want):
             db.update_mapping(m["id"], wan_port=int(want))
+        # 穿透模式：外网端口仍是打洞端口，内部端口必须是实测公网端口
+        if m.get("punch") and m.get("public_port"):
+            want_lan = str(int(m["public_port"]))
+            r0 = raw[rid]
+            fallback0 = {
+                "lan_addr": (r0.get("lan_addr") or "").strip()
+                            or ikuai_client.int_to_ip(r0.get("lan_addr_int"))
+                            or m["lan_ip"],
+                "lan_port": want_lan,
+                "protocol": r0.get("protocol") or m["proto"],
+                "interface": r0.get("interface") or client.interface,
+                "tagname": r0.get("tagname") or m["name"],
+            }
+            if str(r0.get("lan_port")) != want_lan:
+                try:
+                    client.update_dnat(rid, {"lan_port": want_lan}, fallback=fallback0)
+                    log.info(f"对账修正 [{m['name']}] 爱快内部端口 {r0.get('lan_port')} -> {want_lan}")
+                except Exception as e:
+                    log.error(f"对账修正失败 [{m['name']}]: {e}")
+            # 客户端那边可能被改回去/重启过，对账时强制对齐一次
+            _sync_punch(client, m, force=True)
+
         if router[rid] == want:
             continue
         r = raw[rid]

@@ -92,7 +92,15 @@ def init():
                          ("relay_port", "INTEGER"),
                          # 这条映射最近一次问通的 STUN 服务器（页面展示「在用哪台」）
                          ("stun_host", "TEXT"),
-                         ("stun_port", "INTEGER")):
+                         ("stun_port", "INTEGER"),
+                         # 穿透模式：把实测公网端口写进爱快「内部端口」，并下发到 BT 客户端
+                         # 的监听端口，让客户端对外通告的就是公网端口，外部才连得进来
+                         ("punch", "INTEGER DEFAULT 0"),
+                         ("client_kind", "TEXT"),      # qb / tr
+                         ("client_url", "TEXT"),
+                         ("client_user", "TEXT"),
+                         ("client_pass", "TEXT"),
+                         ("client_port", "INTEGER")):  # 已下发到客户端的端口
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 
@@ -138,16 +146,20 @@ def get_mapping(id):
 
 
 def create_mapping(name, lan_ip, lan_port, proto, wan_port=None, rule_id=None,
-                   wan_port_manual=0, probe=1):
+                   wan_port_manual=0, probe=1, punch=0, client_kind=None,
+                   client_url=None, client_user=None, client_pass=None):
     t = now()
     with _lock:
         c = _conn()
         cur = c.execute(
             """INSERT INTO mappings(name, lan_ip, lan_port, proto, wan_port, rule_id,
-                                    wan_port_manual, probe, status, fail_count, created_at, updated_at)
-               VALUES(?,?,?,?,?,?,?,?, 'active', 0, ?, ?)""",
+                                    wan_port_manual, probe, punch, client_kind,
+                                    client_url, client_user, client_pass,
+                                    status, fail_count, created_at, updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?, 'active', 0, ?, ?)""",
             (name, lan_ip, int(lan_port), proto, wan_port, rule_id,
-             int(wan_port_manual), int(probe), t, t),
+             int(wan_port_manual), int(probe), int(punch), client_kind,
+             client_url, client_user, client_pass, t, t),
         )
         mid = cur.lastrowid
         c.commit()

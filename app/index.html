@@ -332,19 +332,65 @@ async function loadMappings(){
       : `<td><span class="muted">待测</span></td>`;
     tr.innerHTML = `
       <td>${m.name}</td>
-      <td>${m.lan_ip}:${m.lan_port}</td>
+      <td>${m.lan_ip}:${m.lan_port}${m.punch&&m.client_port&&m.client_port!==m.lan_port?`<span class="sub-id" title="已下发到客户端的监听端口">→${m.client_port}</span>`:""}</td>
       <td><span class="badge">${m.proto}</span></td>
       ${svCell}
       ${cell}
       <td>${addr}</td>
       <td>${idx+1}${m.rule_id?`<span class="sub-id" title="爱快的内部规则 ID（删过规则会留空号）">#${m.rule_id}</span>`:""}</td>
-      <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?` <span class='badge' style='background:#c0392b;color:#fff' title='爱快上是 ${live}，本地记录应为 ${want}'>未同步</span>`:""}</td>
+      <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${m.punch?` <span class="badge" title="公网端口已下发到客户端监听端口">穿透</span>`:""}${miss?` <span class='badge' style='background:#c0392b;color:#fff' title='爱快上是 ${live}，本地记录应为 ${want}'>未同步</span>`:""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
+        <button class="btn small" onclick="togglePunch(${m.id})">穿透</button>
         <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
+    const pr = document.createElement("tr");
+    pr.id = "pr_" + m.id;
+    pr.style.display = "none";
+    pr.innerHTML = `<td colspan="9"><div class="form">
+      <div><label>穿透</label><select id="pc_on_${m.id}">
+        <option value="0"${m.punch?"":" selected"}>关</option>
+        <option value="1"${m.punch?" selected":""}>开</option></select></div>
+      <div><label>客户端</label><select id="pc_kind_${m.id}">
+        <option value="qb"${(m.client_kind||"qb")==="qb"?" selected":""}>qBittorrent</option>
+        <option value="tr"${m.client_kind==="tr"?" selected":""}>Transmission</option></select></div>
+      <div><label>地址</label><input id="pc_url_${m.id}" style="width:220px" placeholder="http://192.168.6.12:8086" value="${m.client_url||""}"/></div>
+      <div><label>用户名</label><input id="pc_user_${m.id}" style="width:110px" value="${m.client_user||""}"/></div>
+      <div><label>密码</label><input id="pc_pass_${m.id}" type="password" style="width:110px" value="${m.client_pass||""}"/></div>
+      <div><button class="btn primary" onclick="savePunch(${m.id})">保存</button>
+        <button class="btn small" onclick="testPunch(${m.id})">测试</button>
+        <span class="muted" id="pc_msg_${m.id}"></span></div>
+    </div></td>`;
+    tb.appendChild(pr);
   });
+}
+
+function togglePunch(id){
+  const el = document.getElementById("pr_" + id);
+  if(el) el.style.display = (el.style.display === "none") ? "" : "none";
+}
+async function savePunch(id){
+  const body = {
+    punch: Number(document.getElementById("pc_on_" + id).value),
+    client_kind: document.getElementById("pc_kind_" + id).value,
+    client_url: document.getElementById("pc_url_" + id).value.trim(),
+    client_user: document.getElementById("pc_user_" + id).value,
+    client_pass: document.getElementById("pc_pass_" + id).value,
+  };
+  const msg = document.getElementById("pc_msg_" + id);
+  const r = await fetch("/api/mappings/" + id, {method:"PUT",
+    headers:{"Content-Type":"application/json"}, body:JSON.stringify(body)});
+  if(r.ok){ msg.textContent = "已保存"; setTimeout(refresh, 1500); }
+  else msg.textContent = "失败：" + (await r.text());
+}
+async function testPunch(id){
+  const msg = document.getElementById("pc_msg_" + id);
+  msg.textContent = "测试中...";
+  try{
+    const r = await (await fetch("/api/mappings/" + id + "/client/test", {method:"POST"})).json();
+    msg.textContent = r.ok ? ("通，当前监听端口 " + r.port) : ("连不上：" + r.error);
+  }catch(e){ msg.textContent = "请求失败：" + e; }
 }
 
 async function tidyIds(){
