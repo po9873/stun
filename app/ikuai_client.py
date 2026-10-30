@@ -228,6 +228,25 @@ class IKuaiClient:
                     return r
             return {}
 
+    def rule_fields(self, m):
+        """这条映射在爱快上应该长什么样。对账就照这份内容去比对。
+
+        借端口的（relay=1）：内部地址与内部端口原样不动，只把外网端口换成容器
+        借走的那个端口 —— 外网进来的流量由爱快直接转给目标机，不经过容器。
+        """
+        if m.get("relay"):
+            p = int(m["relay_port"])
+            return {"tagname": m["name"], "lan_addr": m["lan_ip"],
+                    "lan_port": str(int(m["lan_port"])),
+                    "wan_port": str(p),
+                    "protocol": m.get("proto") or "tcp",
+                    "interface": self.interface}
+        return {"tagname": m["name"], "lan_addr": m["lan_ip"],
+                "lan_port": str(int(m["lan_port"])),
+                "wan_port": str(int(m.get("wan_port") or m["lan_port"])),
+                "protocol": m.get("proto") or "tcp",
+                "interface": self.interface}
+
     def create_dnat(self, mapping):
         """创建 DNAT 规则，返回规则 ID（rowid）。mapping 含 name/lan_ip/lan_port/proto/wan_port。"""
         body = {
@@ -238,7 +257,8 @@ class IKuaiClient:
             "protocol": mapping["proto"],
             "interface": self.interface,
             "enabled": "yes",
-            "comment": "managed-by-stun",
+            # 备注与名称保持一致，路由上按名字一眼就能认出是哪条
+            "comment": mapping["name"],
             "src_addr": {"custom": [], "object": []},
         }
         data = self._req("POST", "/network/dnat/rules", body)
@@ -273,15 +293,17 @@ class IKuaiClient:
         if not isinstance(src, dict):
             src = {"custom": [], "object": []}
 
+        tag = cur.get("tagname") or (fallback or {}).get("tagname") or ""
         body = {
-            "tagname": cur.get("tagname") or (fallback or {}).get("tagname") or "",
+            "tagname": tag,
             "lan_addr": lan_addr,
             "lan_port": lan_port,
             "wan_port": cur.get("wan_port"),
             "protocol": protocol,
             "interface": interface,
             "enabled": cur.get("enabled") or "yes",
-            "comment": cur.get("comment", ""),
+            # 备注跟着名称走：改名时备注一起改，存量规则也在对账时顺手纠正
+            "comment": fields.get("tagname") or tag,
             "src_addr": src,
         }
         body.update(fields)

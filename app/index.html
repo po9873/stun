@@ -46,6 +46,10 @@
   .kv b{color:var(--txt)}
   .row-actions{display:flex;gap:6px}
   .muted{color:var(--muted)}
+  .sub-id{color:var(--muted);font-size:11px;margin-left:5px}
+  .code-box{background:var(--bg);padding:8px 10px;border:1px solid var(--line);border-radius:6px;
+            overflow-x:auto;white-space:pre-wrap;word-break:break-all;
+            font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
   .logbox{background:#0b1120;border:1px solid var(--line);border-radius:8px;padding:12px;
           margin:0;max-height:520px;overflow:auto;font-family:ui-monospace,Menlo,Consolas,monospace;
           font-size:12px;line-height:1.65;white-space:pre-wrap;word-break:break-all}
@@ -151,13 +155,15 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
       <h3>当前映射</h3>
       <div style="margin-bottom:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn" onclick="reconcile()">立即与爱快对账</button>
+        <button class="btn" onclick="tidyIds()" title="删掉历史空号，把路由上的规则重排成 1..N 连续">整理 ID</button>
         <span class="muted">发现路由上外网端口与本地不一致时，直接推回去（每 5 分钟自动执行）</span>
       </div>
       <table>
         <thead><tr>
           <th>名称</th><th>内网 IP:端口</th><th>协议</th>
           <th>外网端口(爱快)</th><th>公网访问地址</th>
-          <th>爱快规则ID</th><th>状态</th><th>操作</th>
+          <th title="和爱快界面上的序号一致（灰色小字是路由内部 ID，删过规则会留空号）">#</th>
+          <th>状态</th><th>操作</th>
         </tr></thead>
         <tbody id="map_body"></tbody>
       </table>
@@ -166,30 +172,41 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         默认应与内网端口一致。若不一致，该行标红显示「未同步」，每 5 分钟自动推一次，
         也可点上方按钮立即对账。
         「公网访问地址」是 STUN 实测得出、发给别人访问用的地址。
-        容器<b>测不了别的机器</b>：容器拿目标机的端口去探测时，爱快发现那个外部端口
-        已被目标机占着，会另给容器分一个，测出来的就是容器自己那条 CGNAT 映射
-        （实测：目标机是 39213，容器测出 2048）。
-        所以这些行显示 <b>待本机探针</b>——在那台机自己身上跑一下下面的探针就能测出来。
+        容器<b>测不了别的机器</b>：拿目标机的端口去探测时，爱快发现那个外部端口已被目标机
+        占着，只能另给容器分一个，测出来的是容器自己那条（实测目标机 39213、容器测出 2048）。
+        这种装常驻探针就能解决。而软件自己 LISTEN 着的端口（QB 的 46065 之类），
+        探针也绑不上去（Address already in use）—— 这种点<b>开中转</b>：
+        容器借一个空闲端口一直发包，把 CGNAT 上那条映射问出来并保活，
+        爱快只改外网端口，<b>内部端口一点不动</b>，流量依旧直达目标机、来源 IP 也不丢。
       </p>
     </div>
 
     <div class="card">
-      <h3>让每台机测出自己的公网端口</h3>
+      <h3>自动上报：装一次，之后全自动</h3>
       <p class="muted" style="margin:0 0 10px">
-        下面这条命令复制到<b>目标机</b>上执行即可（只需 python3，不用装任何东西）。
-        它会从本机那个端口发一次 TCP STUN，测出公网端口并自动回报给 stun；
-        加 <code>--loop 30</code> 会每 30 秒测一次，顺带把 CGNAT 那条映射保活，端口就不容易漂。
+        CGNAT 的公网端口是每条流单独分配的，容器替别的机器测只能测到容器自己那条
+        （实测目标机 39213、容器测出 2048），所以必须由那台机自己发一次包。
+        这个常驻探针就干这件事：装上后它自己拉清单、自己测、自己回报，
+        以后在页面上加端口它下一轮自动跟上，不用再碰那台机。
       </p>
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <code id="probe_cmd" style="flex:1;min-width:320px;background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:6px;overflow-x:auto;white-space:nowrap"></code>
-        <button class="btn primary" onclick="copyProbe(this)">复制</button>
-        <a class="btn" href="/probe.py" download="probe.py">下载脚本</a>
+      <table>
+        <thead><tr>
+          <th>目标机</th><th>端口</th><th>探针状态</th><th>操作</th>
+        </tr></thead>
+        <tbody id="agent_body"></tbody>
+      </table>
+      <div class="form" style="margin-top:12px">
+        <div><label>目标机 IP</label><input id="d_ip" placeholder="192.168.6.13"></div>
+        <div><label>用户名</label><input id="d_user" value="root"></div>
+        <div><label>密码</label><input id="d_pwd" type="password" placeholder="SSH 密码"></div>
+        <div><label>SSH 端口</label><input id="d_port" value="22"></div>
+        <div><button class="btn primary" onclick="deploy()">自动装上并启动</button></div>
       </div>
       <p class="muted" style="margin:10px 0 0">
-        例：给 QB 那台机（192.168.6.13）测 46065 端口，就在那台机上跑
-        <code>python3 probe.py 46065 --loop 30</code>。
-        想让它长期在后台保活，可挂 crontab 或写成 systemd 服务。
+        连不上 SSH 的机器（Windows / 群晖 / 没开 SSH），用每行右边的「复制命令」，
+        到那台机上粘贴跑一次就好 —— 同样是装完自动跑，只是这一下得手动。
       </p>
+      <pre id="deploy_out" class="code-box" style="display:none;margin:10px 0 0"></pre>
     </div>
   </section>
 
@@ -385,7 +402,7 @@ async function loadMappings(){
   const rows = (await (await fetch("/api/mappings")).json())
     .sort((a,b)=>(a.rule_id||999999)-(b.rule_id||999999));
   const tb = $("map_body"); tb.innerHTML="";
-  rows.forEach(m=>{
+  rows.forEach((m, idx)=>{
     const tr = document.createElement("tr");
     if(m.status==="suspended") tr.className="suspended";
     const dot = m.status==="active"?"s-active":"s-suspended";
@@ -409,27 +426,103 @@ async function loadMappings(){
       : `<td>${fmt(m.wan_port)}</td>`;
     tr.innerHTML = `
       <td>${m.name}</td>
-      <td>${m.lan_ip}:${m.lan_port}</td>
+      <td>${m.lan_ip}:${m.lan_port}${m.relay?`<span class="sub-id" title="容器借这个端口一直发包把映射保活；外网流量由爱快直接转过来，不经容器">借 ${m.relay_port} 保活</span>`:""}</td>
       <td><span class="badge">${m.proto}</span></td>
       ${cell}
       <td>${addr}</td>
-      <td>${fmt(m.rule_id)}</td>
+      <td>${idx+1}${m.rule_id?`<span class="sub-id" title="爱快的内部规则 ID（删过规则会留空号）">#${m.rule_id}</span>`:""}</td>
       <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?" <span class='badge' style='background:#c0392b;color:#fff'>未同步</span>":""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
-        ${(noprobe && !m.public_port)?`<button class="btn small" title="复制在这台机上跑的探针命令" onclick="copyProbeFor(${m.lan_port},this)">探针命令</button>`:""}
+        ${m.relay
+          ? `<button class="btn small" onclick="relayToggle(${m.id}, false, '${m.name}')">关中转</button>`
+          : `<button class="btn small primary" title="容器独占一个端口自己测，再转发给这台机" onclick="relayToggle(${m.id}, true, '${m.name}')">开中转</button>`}
+        ${(noprobe && !m.relay && !m.public_port)?`<button class="btn small" title="复制这台机的一键安装命令" onclick="copyInstall('${m.lan_ip}',this)">装探针</button>`:""}
         <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
   });
-  // 顶部那条通用命令跟着列表走：取第一条还没测出来的端口当示例
-  const need = rows.find(m => m.probe === 0 && !m.public_port);
-  $("probe_cmd").textContent = probeCmd(need ? need.lan_port : 0);
 }
 
-function probeCmd(port){
+function installCmd(ip, kind){
   const base = location.protocol + "//" + location.host;
-  return `curl -s ${base}/probe.py -o probe.py && python3 probe.py ${port || "端口"} --loop 30`;
+  if(kind === "win")
+    return `powershell -NoProfile -Command "iex (iwr -useb ${base}/agent/install.ps1)"`;
+  return `curl -fsSL ${base}/agent/install.sh | sudo sh`;
+}
+
+async function relayToggle(id, on, name){
+  if(on && !confirm(
+    "给「" + name + "」开启借端口？\n\n"
+    + "容器会独占一个空闲端口（比如 40000），一直从它发包把 CGNAT 上那条映射保活，\n"
+    + "爱快这条规则只改外网端口 = 40000，内部端口和内部地址都不动。\n"
+    + "好处：公网端口自动测出来，流量仍然直达目标机，来源 IP 也不丢。\n\n确定开启？")) return;
+  try{
+    await fetch("/api/mappings/" + id + "/relay", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({on: on})
+    });
+  }catch(e){ alert("请求失败：" + e); }
+  refresh();
+}
+
+async function loadAgents(){
+  let rows = [];
+  try { rows = await (await fetch("/api/agent/hosts")).json(); } catch(e){ return; }
+  const tb = $("agent_body"); tb.innerHTML="";
+  rows.forEach(h=>{
+    const tr = document.createElement("tr");
+    const dot = h.online ? "s-active" : "s-down";
+    const age = h.age === null ? "" : (h.age < 60 ? h.age + " 秒前" : Math.round(h.age/60) + " 分钟前");
+    tr.innerHTML = `
+      <td>${h.lan_ip}</td>
+      <td>${h.ports.join(", ")}</td>
+      <td><span class="status-dot ${dot}"></span>${h.online ? "在线" : "没装 / 离线"}
+          <span class="muted">${h.online ? "" : age}</span>
+          <span class="badge" style="margin-left:6px">${h.got}/${h.ports.length} 已测出</span></td>
+      <td><div class="row-actions">
+        <button class="btn small" onclick="copyInstall('${h.lan_ip}', this)">Linux 命令</button>
+        <button class="btn small" onclick="copyInstallWin('${h.lan_ip}', this)">Windows 命令</button>
+        <button class="btn small primary" onclick="fillDeploy('${h.lan_ip}')">自动装</button>
+      </div></td>`;
+    tb.appendChild(tr);
+  });
+}
+
+function fillDeploy(ip){
+  $("d_ip").value = ip;
+  if(!$("d_user").value.trim()) $("d_user").value = "root";
+  $("d_pwd").focus();
+}
+
+async function deploy(){
+  const ip = $("d_ip").value.trim();
+  if(!ip){ alert("先填目标机 IP"); return; }
+  const out = $("deploy_out");
+  out.style.display = "block";
+  out.textContent = "正在连接 " + ip + " 并自动安装…";
+  try{
+    const r = await (await fetch("/api/agent/deploy", {
+      method: "POST", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({ip: ip, user: $("d_user").value.trim() || "root",
+                            password: $("d_pwd").value,
+                            port: parseInt($("d_port").value || "22")})
+    })).json();
+    out.textContent = (r.ok ? "✔ 装好了（" + r.kind + "）\n" : "✘ 没装成（" + (r.stage||"") + "）\n")
+                      + (r.output || "");
+  }catch(e){ out.textContent = "请求失败：" + e; }
+  loadAgents();
+}
+
+async function tidyIds(){
+  if(!confirm("整理 ID 会把爱快上的规则全部删除，再按现在的顺序重建，"
+    + "重建期间穿透会中断十几秒。\n重建后编号变成 1..N 连续。\n\n确定继续？")) return;
+  try{
+    const r = await (await fetch("/api/ikuai/tidy", {method:"POST"})).json();
+    if(r.ok) alert("整理完成：" + r.before.join(",") + "  →  " + r.after.join(","));
+    else alert("整理出问题：" + (r.error || ("重建失败 " + r.failed + " 条，备份在 " + r.backup)));
+  }catch(e){ alert("请求失败：" + e); }
+  refresh();
 }
 async function copyText(t, btn){
   let ok = true;
@@ -445,8 +538,8 @@ async function copyText(t, btn){
            setTimeout(()=>btn.textContent = old, 1500); }
   else if(!ok){ prompt("复制这条命令：", t); }
 }
-function copyProbe(btn){ copyText($("probe_cmd").textContent, btn); }
-function copyProbeFor(port, btn){ copyText(probeCmd(port), btn); }
+function copyInstall(ip, btn){ copyText(installCmd(ip, "sh"), btn); }
+function copyInstallWin(ip, btn){ copyText(installCmd(ip, "win"), btn); }
 
 async function loadStun(){
   const rows = await (await fetch("/api/stun")).json();
@@ -704,7 +797,7 @@ async function clearLogs(){
   loadLogs();
 }
 
-async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); }
+async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); await loadAgents(); }
 setInterval(refresh, 15000);
 setInterval(()=>{ if($("tab-log").style.display!=="none") loadLogs(); }, 5000);
 

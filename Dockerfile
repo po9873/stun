@@ -20,8 +20,19 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then \
     fi
 
 COPY app ./app
-# 探针客户端：单文件、只依赖标准库，由 WebUI 的 /probe.py 分发给内网机器
+# 探针客户端：单文件、只依赖标准库，由 WebUI 分发给内网机器
 COPY probe_client.py ./probe_client.py
+# 常驻探针（agent）：装在目标机上，自己拉清单、自己测、自己上报
+COPY agent_client.py ./agent_client.py
+
+# 自动把 agent 装到目标机上要用到 ssh / sshpass
+ARG APT_MIRROR=""
+RUN if [ -n "$APT_MIRROR" ]; then \
+      sed -i "s|deb.debian.org|$APT_MIRROR|g;s|security.debian.org|$APT_MIRROR|g" \
+          /etc/apt/sources.list.d/debian.sources; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
+      openssh-client sshpass && rm -rf /var/lib/apt/lists/*
 
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \

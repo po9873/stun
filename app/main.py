@@ -5,7 +5,9 @@
 import logging
 import re
 import socket
+import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,8 +15,8 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import (config, db, ikuai_client, logbuf, notifier, poller, settings,
-               state, stun_probe)
+from . import (config, db, ikuai_client, logbuf, notifier, poller, relay,
+               settings, state, stun_probe)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 log = logging.getLogger("stun")
@@ -225,6 +227,70 @@ def api_clear_logs():
 @app.get("/api/mappings")
 def api_list_mappings():
     return db.list_mappings()
+
+
+def _rule_fields(m, client):
+    """这条映射在爱快上应该长什么样：中转的指到容器的独占端口，其余指到目标机。"""
+    return client.rule_fields(m)
+
+
+def _push_rule(m):
+    """把规则内容推到爱快（中转时指向容器，关闭后指回目标机）。"""
+    if not m.get("rule_id"):
+        return False
+    client = ikuai_client.IKuaiClient()
+    fields = _rule_fields(m, client)
+    want = {k: fields[k] for k in ("lan_addr", "lan_port", "wan_port")}
+    for attempt in range(2):
+        try:
+            client.update_dnat(m["rule_id"], want, fallback=fields)
+            return True
+        except Exception as e:
+            if attempt == 0:
+                time.sleep(1.5)      # 刚创建的规则爱快有时取不完整，等一下重试
+            else:
+                log.error(f"[{m['name']}] 更新爱快规则失败: {e}")
+    return False
+
+
+@app.post("/api/mappings/{mid}/relay")
+def api_toggle_relay(mid: int, body: dict):
+    """开/关容器中转。
+
+    打开：容器独占一个端口，爱快规则改指到容器，容器自己测公网端口并转发流量；
+    关闭：规则改回直连目标机（或只留容器自测，看你怎么用）。
+    """
+    m = db.get_mapping(mid)
+    if not m:
+        raise HTTPException(404, "映射不存在")
+    on = bool(body.get("on"))
+    if on == bool(m.get("relay")):
+        return db.get_mapping(mid)
+    if on:
+        port = int(m.get("relay_port") or 0) or relay.pick_port()
+        db.update_mapping(mid, relay=1, relay_port=port, wan_port=port, probe=0)
+        m = db.get_mapping(mid)
+        if _push_rule(m):
+            log.info(f"[{m['name']}] 已开启借端口：容器 {relay.container_ip()}:{port} 保活，"
+                     f"爱快把外网 {port} 直连 {m['lan_ip']}:{m['lan_port']}")
+        relay.attach(m)
+        threading.Thread(target=relay.probe,
+                         args=(port, db.get_best_stun_server()),
+                         daemon=True).start()
+    else:
+        # 关掉后外网端口回到内网端口（端口保留），内部端口始终没动过
+        db.update_mapping(mid, relay=0, wan_port=int(m["lan_port"]))
+        m = db.get_mapping(mid)
+        if _push_rule(m):
+            log.info(f"[{m['name']}] 已关闭中转，规则改回直连 "
+                     f"{m['lan_ip']}:{m['lan_port']}")
+        relay.sync_all()
+    return db.get_mapping(mid)
+
+
+@app.get("/api/relay/status")
+def api_relay_status():
+    return relay.status()
 
 
 @app.post("/api/mappings")
@@ -559,34 +625,334 @@ class ProbeReportIn(BaseModel):
     public_port: Optional[int] = None
 
 
-@app.post("/api/probe/report")
-def api_probe_report(req: ProbeReportIn):
-    """接收目标机自己测出来的公网端口。
+def _apply_report(lan_ip, results):
+    """把目标机自己测出来的 (lan_ip, lan_port, 公网端口) 写进库。
 
     容器测别的机器是测不准的：爱快 NAT 发现那个外部端口已被目标机占着，
     会给容器另分一个，测到的是容器自己那条 CGNAT 映射（实测目标机 39213、
-    容器测出 2048）。所以目标机自己发包的测量结果才是权威值，存的时候
+    容器测出 2048）。所以只有目标机自己发包的测量结果才是权威值，存的时候
     标 public_exact=1，并保留 probe=0（容器不必再白测）。
     """
     # 目标机是容器自己时，容器本来就能测准，保留轮询让它持续保活；
     # 只有别人报上来的（容器测不了的那些）才关掉轮询，免得拿垃圾值盖掉权威值
-    keep_probe = req.lan_ip in local_ips()
+    keep_probe = lan_ip in local_ips()
+    seen = int(time.time())
     matched = []
-    for m in db.list_mappings():
-        if m["lan_ip"] != req.lan_ip or int(m["lan_port"]) != int(req.lan_port):
+    for r in results or []:
+        if not r.get("ok") or not r.get("public_port"):
             continue
-        old = m.get("public_port")
-        db.update_mapping(m["id"], public_port=req.public_port,
-                          public_exact=1, probe=1 if keep_probe else 0)
-        matched.append(m["name"])
-        if old != req.public_port:
-            log.info(f"探针回报 [{m['name']}] 公网端口 {old} -> {req.public_port}")
-            try:
-                notifier.public_port_changed(m, old, req.public_port,
-                                             ext_ip=req.public_ip)
-            except Exception:
-                pass
-    if req.public_ip:
-        state.set(external_ip=req.public_ip)
+        port = int(r["lan_port"])
+        for m in db.list_mappings():
+            if m["lan_ip"] != lan_ip or int(m["lan_port"]) != port:
+                continue
+            old = m.get("public_port")
+            db.update_mapping(m["id"], public_port=r["public_port"],
+                              public_exact=1, probe=1 if keep_probe else 0,
+                              agent_seen=seen)
+            matched.append(m["name"])
+            if old != r["public_port"]:
+                log.info(f"探针回报 [{m['name']}] 公网端口 {old} -> {r['public_port']}")
+                try:
+                    notifier.public_port_changed(m, old, r["public_port"],
+                                                 ext_ip=r.get("public_ip"))
+                except Exception:
+                    pass
+        if r.get("public_ip"):
+            state.set(external_ip=r["public_ip"])
+    return matched
+
+
+@app.post("/api/probe/report")
+def api_probe_report(req: ProbeReportIn):
+    matched = _apply_report(req.lan_ip, [{
+        "lan_port": req.lan_port, "public_ip": req.public_ip,
+        "public_port": req.public_port, "ok": 1 if req.public_port else 0,
+    }])
     return {"ok": True, "matched": matched or "本机没有端口匹配的映射"}
-    return {"ok": True}
+
+
+# ---------------- 常驻探针 agent：装一次，之后全自动 ----------------
+@app.get("/agent.py", response_class=PlainTextResponse)
+def api_agent_script(request: Request):
+    """下载常驻探针源码（服务端地址已填好，直接 python3 agent.py 就能跑）。"""
+    src = (_HERE.parent / "agent_client.py").read_text(encoding="utf-8")
+    base = str(request.base_url).rstrip("/")
+    return src.replace('os.environ.get("STUN_SERVER") or ""', '"%s"' % base)
+
+
+INSTALL_SH = r"""#!/bin/sh
+# stun 常驻探针一键安装（Linux）
+#   curl -fsSL __BASE__/agent/install.sh | sudo sh
+# 装完自己常驻、开机自启；以后在页面上加端口，它自己会拉到新清单。
+set -e
+BASE=__BASE__
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then
+  echo "这台机没有 python3，先装一个：apt-get install -y python3 （或 yum install -y python3）"
+  exit 1
+fi
+DIR=/opt/stun
+mkdir -p "$DIR"
+echo "下载探针 -> $DIR/agent.py"
+curl -fsSL "$BASE/agent.py" -o "$DIR/agent.py"
+chmod +x "$DIR/agent.py"
+echo "先跑一轮自检："
+"$PY" "$DIR/agent.py" --server "$BASE" --once || true
+
+if command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]; then
+  cat > /etc/systemd/system/stun-agent.service <<UNIT
+[Unit]
+Description=stun public port agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$PY $DIR/agent.py --server $BASE --interval 30
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable stun-agent >/dev/null 2>&1 || true
+  systemctl restart stun-agent
+  echo "OK 已注册 systemd 服务 stun-agent（开机自启，崩了自动拉起）"
+  echo "   看状态：systemctl status stun-agent    看日志：journalctl -u stun-agent -f"
+else
+  # 没有 systemd 的机器（OpenWrt / 老系统）：现在拉起来，并写进 crontab 开机自启
+  nohup "$PY" "$DIR/agent.py" --server "$BASE" --interval 30 >>/var/log/stun-agent.log 2>&1 &
+  ( crontab -l 2>/dev/null | grep -v 'stun-agent' ; \
+    echo "@reboot $PY $DIR/agent.py --server $BASE --interval 30 >>/var/log/stun-agent.log 2>&1 &" ) \
+    | crontab - 2>/dev/null || true
+  echo "OK 已启动并写入 crontab @reboot（日志 /var/log/stun-agent.log）"
+fi
+echo "以后这台机的公网端口会自动上报到 $BASE"
+"""
+
+INSTALL_PS1 = r"""# stun 常驻探针一键安装（Windows），管理员 PowerShell 里跑：
+#   iex (iwr -useb __BASE__/agent/install.ps1)
+$Base = "__BASE__"
+$Dir  = Join-Path $env:ProgramData "stun"
+New-Item -ItemType Directory -Force -Path $Dir | Out-Null
+Write-Host "下载探针 -> $Dir\agent.py"
+Invoke-WebRequest -UseBasicParsing "$Base/agent.py" -OutFile "$Dir\agent.py"
+$py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+if (-not $py) {
+  Write-Host "没找到 Python，先装 https://www.python.org/downloads/ （记得勾 Add to PATH）"
+  exit 1
+}
+$PyPath = $py.Source
+& $PyPath "$Dir\agent.py" --server $Base --once
+schtasks /Create /TN "stun-agent" /SC ONSTART /RU SYSTEM /RL HIGHEST /F /TR "`"$PyPath`" `"$Dir\agent.py`" --server $Base --interval 30" | Out-Null
+schtasks /Run /TN "stun-agent" | Out-Null
+Write-Host "装好了：开机自启，公网端口会自动上报到 $Base"
+"""
+
+
+@app.get("/agent/install.sh", response_class=PlainTextResponse)
+def api_install_sh(request: Request):
+    return INSTALL_SH.replace("__BASE__", str(request.base_url).rstrip("/"))
+
+
+@app.get("/agent/install.ps1", response_class=PlainTextResponse)
+def api_install_ps1(request: Request):
+    return INSTALL_PS1.replace("__BASE__", str(request.base_url).rstrip("/"))
+
+
+@app.get("/api/agent/plan")
+def api_agent_plan(request: Request, ip: str = ""):
+    """目标机来问「我该测哪些端口」。
+
+    清单按来源 IP 现算，所以页面上加/改端口都不用再动那台机 —— 它下一轮自己就拉到了。
+    """
+    lan_ip = (ip or "").strip() or (request.client.host if request.client else "")
+    interval = int(db.get_setting("agent_interval") or 30)
+    ports = []
+    for m in db.list_mappings():
+        if m["lan_ip"] != lan_ip:
+            continue
+        # 纯 UDP 目前测不了（UDP STUN 走不通），别让它白忙
+        if "tcp" not in (m["proto"] or "").lower():
+            continue
+        p = int(m["lan_port"])
+        if p not in ports:
+            ports.append(p)
+    servers = ["%s:%s" % (s["host"], s["port"])
+               for s in db.list_stun_servers() if s.get("status") == "active"][:5]
+    return {"lan_ip": lan_ip, "ports": ports, "interval": interval,
+            "servers": servers or ["stun.chat.bilibili.com:3478",
+                                   "global.stun.twilio.com:3478"]}
+
+
+class AgentReportIn(BaseModel):
+    lan_ip: str
+    results: list = []
+    hostname: Optional[str] = None
+    interval: Optional[int] = None
+    version: Optional[str] = None
+
+
+@app.post("/api/agent/report")
+def api_agent_report(req: AgentReportIn):
+    """收常驻探针批量回报的公网端口。"""
+    matched = _apply_report(req.lan_ip, req.results)
+    if req.interval:
+        db.set_setting("agent_interval", str(int(req.interval)))
+    return {"ok": True, "matched": matched}
+
+
+@app.get("/api/agent/hosts")
+def api_agent_hosts():
+    """每台目标机的探针状态：有没有在线、最后一次上报是什么时候。"""
+    now_ts = int(time.time())
+    hosts = {}
+    for m in db.list_mappings():
+        h = hosts.setdefault(m["lan_ip"], {"lan_ip": m["lan_ip"], "ports": [],
+                                           "seen": 0, "got": 0})
+        h["ports"].append(int(m["lan_port"]))
+        h["seen"] = max(h["seen"], int(m.get("agent_seen") or 0))
+        if m.get("public_port"):
+            h["got"] += 1
+    out = []
+    for h in hosts.values():
+        h["ports"].sort()
+        h["online"] = bool(h["seen"] and now_ts - h["seen"] < 180)
+        h["age"] = (now_ts - h["seen"]) if h["seen"] else None
+        out.append(h)
+    out.sort(key=lambda x: [int(p) for p in x["lan_ip"].split(".")])
+    return out
+
+
+class DeployIn(BaseModel):
+    ip: str
+    user: str = "root"
+    password: str = ""
+    port: int = 22
+    kind: str = "auto"          # auto / linux / windows
+
+
+def _shq(s):
+    """把字符串安全地塞进远程 shell 的单引号里。"""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _ssh(host, user, pwd, port, cmd, timeout=60):
+    args = ["sshpass", "-p", pwd, "ssh",
+            "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+            "-o", "ConnectTimeout=10", "-o", "LogLevel=ERROR",
+            "-p", str(port), "%s@%s" % (user, host), cmd]
+    try:
+        p = subprocess.run(args, capture_output=True, timeout=timeout)
+        return p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
+    except subprocess.TimeoutExpired:
+        return 124, "远程执行超时（%ss）" % timeout
+    except FileNotFoundError:
+        return 127, "容器里没装 sshpass/ssh，镜像需包含 openssh-client 与 sshpass"
+
+
+@app.post("/api/agent/deploy")
+def api_agent_deploy(request: Request, req: DeployIn):
+    """替用户把探针装到目标机上：页面填 IP + 账号密码，剩下的容器自己走 SSH 干完。"""
+    base = str(request.base_url).rstrip("/")
+    kind = req.kind
+    if kind == "auto":
+        rc, out = _ssh(req.ip, req.user, req.password, req.port, "uname -s", timeout=20)
+        if rc != 0:
+            log.warning(f"SSH 连不上 {req.ip}: {out.strip()[:200]}")
+            return {"ok": False, "stage": "connect", "output": out.strip()[-2000:]}
+        u = out.lower()
+        kind = ("windows" if ("mingw" in u or "cygwin" in u or "windows" in u)
+                else "linux")
+    if kind == "windows":
+        cmd = ('powershell -NoProfile -Command '
+               '"iex (iwr -useb %s/agent/install.ps1)"' % base)
+    else:
+        inner = (
+            'curl -fsSL %s/agent/install.sh -o /tmp/stun-agent-install.sh && '
+            '{ if [ "$(id -u)" = 0 ]; then sh /tmp/stun-agent-install.sh; '
+            'else printf "%%s\\n" %s | sudo -S -p "" sh /tmp/stun-agent-install.sh; fi }'
+            % (base, _shq(req.password)))
+        cmd = "sh -c %s" % _shq(inner)
+    rc, out = _ssh(req.ip, req.user, req.password, req.port, cmd, timeout=240)
+    ok = rc == 0
+    txt = out.strip()
+    if ok:
+        log.info(f"已自动把探针装到 {req.ip}（{kind}）")
+    else:
+        log.error(f"自动部署到 {req.ip} 失败：{txt[:300]}")
+    return {"ok": ok, "stage": "install", "kind": kind,
+            "output": txt[-4000:] or ("无输出，退出码 %s" % rc)}
+
+
+@app.post("/api/ikuai/tidy")
+def api_tidy_rules():
+    """整理爱快上的规则 ID：把历史空号（删规则留下的）抹掉，重排成 1..N 连续。
+
+    做法是全量读出 → 全部删除 → 按原顺序重建，ID 会重新从 1 开始。
+    重建前会在容器里留一份备份，中途失败也能按备份补回来。
+    注意：重建期间路由上的映射会短暂失效（十几秒）。
+    """
+    import json
+    import os
+
+    client = ikuai_client.IKuaiClient()
+    raws = client.list_dnat()
+    if not raws:
+        return {"ok": False, "error": "路由上没有规则"}
+
+    items, old_ids = [], []
+    for r in sorted(raws, key=lambda x: int(x.get("id") or 0)):
+        old_ids.append(int(r.get("id") or 0))
+        addr = (r.get("lan_addr") or "").strip()
+        if not addr or addr == "0.0.0.0":
+            addr = ikuai_client.int_to_ip(r.get("lan_addr_int")) or ""
+        if not addr:
+            continue
+        items.append({
+            "tagname": (r.get("tagname") or "").strip(),
+            "lan_addr": addr,
+            "lan_port": str(r.get("lan_port") or ""),
+            "wan_port": str(r.get("wan_port") or ""),
+            "protocol": r.get("protocol") or "tcp",
+            "interface": r.get("interface") or client.interface,
+            "enabled": str(r.get("enabled") or "yes"),
+            "comment": r.get("comment") or "",
+            "src_addr": r.get("src_addr") or {"custom": [], "object": []},
+        })
+
+    backup = os.path.join(config.DATA_DIR, "ikuai_backup_%d.json" % int(time.time()))
+    try:
+        with open(backup, "w", encoding="utf-8") as f:
+            json.dump(items, f, ensure_ascii=False)
+    except Exception as e:
+        backup = "（写备份失败：%s）" % e
+
+    for rid in old_ids:
+        try:
+            client._req("DELETE", "/network/dnat/rules/%d" % rid)
+        except Exception as e:
+            log.warning(f"整理 ID：删旧规则 {rid} 失败 {e}")
+
+    new_ids, failed = [], 0
+    for it in items:
+        try:
+            d = client._req("POST", "/network/dnat/rules", it)
+            new_ids.append(int(d.get("rowid")))
+        except Exception as e:
+            failed += 1
+            log.error(f"整理 ID：重建 {it.get('tagname')} 失败 {e}")
+
+    # 按 (内网地址, 内网端口) 把新 ID 写回本地
+    for r in client.read_rules():
+        for m in db.list_mappings():
+            if (m["lan_ip"] == r["lan_addr"]
+                    and int(m["lan_port"]) == int(r["lan_port"])
+                    and m["rule_id"] != r["id"]):
+                db.update_mapping(m["id"], rule_id=r["id"])
+
+    log.info(f"整理 ID 完成：{old_ids} -> {new_ids}（失败 {failed} 条，备份 {backup}）")
+    return {"ok": failed == 0, "before": old_ids, "after": new_ids,
+            "failed": failed, "backup": backup}

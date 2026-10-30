@@ -82,7 +82,14 @@ def init():
                          ("wan_port_manual", "INTEGER DEFAULT 0"),
                          # probe=0：目标机不是容器自己，测到的公网端口属于容器而非目标机，
                          # 没有意义，因此不轮询探测（省掉每轮 N 次无效 STUN 握手）
-                         ("probe", "INTEGER DEFAULT 1")):
+                         ("probe", "INTEGER DEFAULT 1"),
+                         # 目标机上装的常驻探针最后一次回报的时间戳；
+                         # 页面靠它显示「这台机的探针在线/离线」
+                         ("agent_seen", "INTEGER DEFAULT 0"),
+                         # relay=1：这条走容器中转。容器独占 relay_port 这个端口，
+                         # 自己测公网端口并把流量转发给真正的目标机
+                         ("relay", "INTEGER DEFAULT 0"),
+                         ("relay_port", "INTEGER")):
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 

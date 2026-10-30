@@ -64,9 +64,48 @@ def _loop():
         _stop.wait(config.POLL_INTERVAL)
 
 
+def _poll_relay(client):
+    """中转模式的映射：容器独占端口，自己测出来的公网端口就是这条映射的公网地址。
+
+    每轮测一次同时也是心跳 —— 这个端口一直在往外发，CGNAT 那条映射才不会被运营商收回去。
+    """
+    from . import relay
+    targets = [m for m in db.list_mappings()
+               if m.get("relay") and m.get("relay_port") and m["status"] == "active"]
+    if not targets:
+        relay.sync_all()
+        return
+    for m in targets:
+        relay.attach(m)
+    server = db.get_best_stun_server()
+    for m in targets:
+        ext_ip, ext_port = relay.probe(int(m["relay_port"]), server)
+        if ext_port is None:
+            continue
+        if ext_ip:
+            state.set(external_ip=ext_ip)
+        if m.get("public_port") == ext_port:
+            continue
+        old = m.get("public_port")
+        db.update_mapping(m["id"], public_port=ext_port, public_exact=1,
+                          fail_count=0, agent_seen=int(time.time()))
+        log.info(f"中转公网端口变化 [{m['name']}] {old} -> {ext_port}"
+                 f"（容器端口 {m['relay_port']}）")
+        try:
+            notifier.public_port_changed(
+                m, old, ext_port, ext_ip or state.get()["external_ip"])
+        except Exception:
+            pass
+    relay.sync_all()
+
+
 def _poll_mappings(client):
+    _poll_relay(client)
     for m in db.list_mappings():
         if m["status"] != "active":
+            continue
+        # 走容器中转的：公网端口由容器那个独占端口测出来，别再拿目标机端口白测
+        if m.get("relay"):
             continue
         # probe=0：目标机不是容器自己，探测结果无意义，不做无谓的 STUN 握手
         if not m.get("probe", 1):
@@ -212,6 +251,21 @@ def _reconcile(client):
         rid = int(m["rule_id"])
         if rid not in router:
             continue
+        # 中转：规则整条指向容器的独占端口，三个字段都得对得上
+        if m.get("relay"):
+            fields = client.rule_fields(m)
+            r = raw[rid]
+            diffs = {k: v for k, v in fields.items() if str(r.get(k)) != str(v)}
+            if diffs:
+                try:
+                    client.update_dnat(rid, diffs, fallback=fields)
+                    fixed += 1
+                    router[rid] = fields["wan_port"]
+                    log.info(f"对账修正 [{m['name']}] 中转规则已对齐：{diffs}")
+                except Exception as e:
+                    log.error(f"对账修正失败 [{m['name']}]: {e}")
+                    notifier.rule_failed(m["name"], f"对账修正失败：{e}")
+            continue
         manual = bool(m.get("wan_port_manual"))
         if stun_mode and not m.get("public_exact", 1):
             # 跨 IP 探测得到的公网端口不可信，stun 模式下也不拿它去改路由
@@ -271,18 +325,19 @@ def _resume(client, m):
     preserve 且非手填 → 外网端口 = 内网端口；手填 → 用填的值；stun 模式 → 用实测值。
     """
     from . import settings as _settings
-    if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
-            and m.get("public_exact", 1)):
-        wan_port = m["public_port"]
-    elif m.get("wan_port_manual") and m.get("wan_port"):
-        wan_port = m["wan_port"]
-    else:
-        wan_port = m["lan_port"]
+    # 中转的规则内容本身就已经指向容器，外网端口恒等于容器端口，不能再按常规改
+    fields = client.rule_fields(m)
+    if not m.get("relay"):
+        if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
+                and m.get("public_exact", 1)):
+            fields["wan_port"] = str(int(m["public_port"]))
+        elif m.get("wan_port_manual") and m.get("wan_port"):
+            fields["wan_port"] = str(int(m["wan_port"]))
     try:
         rid = client.create_dnat({
-            "name": m["name"], "lan_ip": m["lan_ip"],
-            "lan_port": m["lan_port"], "proto": m["proto"],
-            "wan_port": wan_port,
+            "name": fields["tagname"], "lan_ip": fields["lan_addr"],
+            "lan_port": fields["lan_port"], "proto": fields["protocol"],
+            "wan_port": fields["wan_port"],
         })
         db.update_mapping(m["id"], status="active", rule_id=rid,
                           note="", fail_count=0)
