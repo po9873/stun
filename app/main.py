@@ -9,8 +9,8 @@ import threading
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
 from . import (config, db, ikuai_client, logbuf, notifier, poller, settings,
@@ -492,6 +492,12 @@ def api_list_stun():
     return db.list_stun_servers()
 
 
+@app.get("/api/stun/servers")
+def api_active_stun_servers():
+    """给探针客户端用：返回当前可用的服务器清单。"""
+    return [s for s in db.list_stun_servers() if s.get("status") == "active"]
+
+
 @app.post("/api/stun/scan")
 def api_scan_stun():
     res = stun_probe.scan_servers()
@@ -533,4 +539,54 @@ def api_add_stun(req: StunIn):
 @app.delete("/api/stun/{sid}")
 def api_delete_stun(sid: int):
     db.delete_stun_server(sid)
+
+
+# ---------------- 探针客户端（跑在内网的目标机上） ----------------
+@app.get("/probe.py", response_class=PlainTextResponse)
+def api_probe_script(request: Request):
+    """下载探针脚本。地址已自动填好，拿过去直接 `python3 probe.py <端口>`。"""
+    src = (_HERE.parent / "probe_client.py").read_text(encoding="utf-8")
+    base = str(request.base_url).rstrip("/")
+    src = src.replace('__import__("os").environ.get("STUN_SERVER")',
+                      '"%s"' % base)
+    return src
+
+
+class ProbeReportIn(BaseModel):
+    lan_ip: str
+    lan_port: int
+    public_ip: Optional[str] = None
+    public_port: Optional[int] = None
+
+
+@app.post("/api/probe/report")
+def api_probe_report(req: ProbeReportIn):
+    """接收目标机自己测出来的公网端口。
+
+    容器测别的机器是测不准的：爱快 NAT 发现那个外部端口已被目标机占着，
+    会给容器另分一个，测到的是容器自己那条 CGNAT 映射（实测目标机 39213、
+    容器测出 2048）。所以目标机自己发包的测量结果才是权威值，存的时候
+    标 public_exact=1，并保留 probe=0（容器不必再白测）。
+    """
+    # 目标机是容器自己时，容器本来就能测准，保留轮询让它持续保活；
+    # 只有别人报上来的（容器测不了的那些）才关掉轮询，免得拿垃圾值盖掉权威值
+    keep_probe = req.lan_ip in local_ips()
+    matched = []
+    for m in db.list_mappings():
+        if m["lan_ip"] != req.lan_ip or int(m["lan_port"]) != int(req.lan_port):
+            continue
+        old = m.get("public_port")
+        db.update_mapping(m["id"], public_port=req.public_port,
+                          public_exact=1, probe=1 if keep_probe else 0)
+        matched.append(m["name"])
+        if old != req.public_port:
+            log.info(f"探针回报 [{m['name']}] 公网端口 {old} -> {req.public_port}")
+            try:
+                notifier.public_port_changed(m, old, req.public_port,
+                                             ext_ip=req.public_ip)
+            except Exception:
+                pass
+    if req.public_ip:
+        state.set(external_ip=req.public_ip)
+    return {"ok": True, "matched": matched or "本机没有端口匹配的映射"}
     return {"ok": True}

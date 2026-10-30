@@ -165,11 +165,30 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         「外网端口(爱快)」是对账时从路由上读回的真实值，不是本地想当然的值；
         默认应与内网端口一致。若不一致，该行标红显示「未同步」，每 5 分钟自动推一次，
         也可点上方按钮立即对账。
-        「公网访问地址」由 STUN 实测得出，是发给别人访问用的地址。
-        显示 <b>不可测</b> 的表示目标机不是容器自己 —— 容器绑不到它的内网 IP，
-        测出来的是容器自己那条 CGNAT 映射，与目标机无关（CGNAT 会给不同内网 IP
-        分配不同公网端口），所以不做无谓探测，也不会拿它去改路由。
-        想要某个服务的真实公网端口，只能由那台机器自己发出连接。
+        「公网访问地址」是 STUN 实测得出、发给别人访问用的地址。
+        容器<b>测不了别的机器</b>：容器拿目标机的端口去探测时，爱快发现那个外部端口
+        已被目标机占着，会另给容器分一个，测出来的就是容器自己那条 CGNAT 映射
+        （实测：目标机是 39213，容器测出 2048）。
+        所以这些行显示 <b>待本机探针</b>——在那台机自己身上跑一下下面的探针就能测出来。
+      </p>
+    </div>
+
+    <div class="card">
+      <h3>让每台机测出自己的公网端口</h3>
+      <p class="muted" style="margin:0 0 10px">
+        下面这条命令复制到<b>目标机</b>上执行即可（只需 python3，不用装任何东西）。
+        它会从本机那个端口发一次 TCP STUN，测出公网端口并自动回报给 stun；
+        加 <code>--loop 30</code> 会每 30 秒测一次，顺带把 CGNAT 那条映射保活，端口就不容易漂。
+      </p>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <code id="probe_cmd" style="flex:1;min-width:320px;background:var(--bg);padding:8px;border:1px solid var(--line);border-radius:6px;overflow-x:auto;white-space:nowrap"></code>
+        <button class="btn primary" onclick="copyProbe(this)">复制</button>
+        <a class="btn" href="/probe.py" download="probe.py">下载脚本</a>
+      </div>
+      <p class="muted" style="margin:10px 0 0">
+        例：给 QB 那台机（192.168.6.13）测 46065 端口，就在那台机上跑
+        <code>python3 probe.py 46065 --loop 30</code>。
+        想让它长期在后台保活，可挂 crontab 或写成 systemd 服务。
       </p>
     </div>
   </section>
@@ -370,12 +389,16 @@ async function loadMappings(){
     const tr = document.createElement("tr");
     if(m.status==="suspended") tr.className="suspended";
     const dot = m.status==="active"?"s-active":"s-suspended";
-    // 目标机不是容器自己 → 绑不到它的内网 IP，测出来的是容器自己的映射，没有意义
+    // 容器自己测不准别的机器（爱快会给容器另分外部端口），但目标机装了探针
+    // 后回报上来的值是权威的，这时照样显示出来
     const noprobe = m.probe === 0;
-    const addr = noprobe
-      ? '<span class="muted" title="目标机不是容器自身，容器测到的是自己那条 CGNAT 映射，与目标机无关">不可测</span>'
-      : ((EXT_IP && m.public_port) ? `${EXT_IP}:${m.public_port}`
-                                   : (m.public_port ? `:${m.public_port}` : "—"));
+    const addr = (EXT_IP && m.public_port)
+      ? `${EXT_IP}:${m.public_port}`
+      : (m.public_port
+          ? `:${m.public_port}`
+          : (noprobe
+             ? `<span class="muted" title="容器测不准别的机器；在这台机自己身上跑一下探针就能测出来">待本机探针</span>`
+             : "—"));
     // 爱快上真实生效的外网端口（对账读回）；与本地不一致时标红提示
     const live = m.rule_id ? (ROUTER[String(m.rule_id)] || null) : null;
     const want = String(m.wan_port || m.lan_port);
@@ -394,11 +417,36 @@ async function loadMappings(){
       <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?" <span class='badge' style='background:#c0392b;color:#fff'>未同步</span>":""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
+        ${(noprobe && !m.public_port)?`<button class="btn small" title="复制在这台机上跑的探针命令" onclick="copyProbeFor(${m.lan_port},this)">探针命令</button>`:""}
         <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
   });
+  // 顶部那条通用命令跟着列表走：取第一条还没测出来的端口当示例
+  const need = rows.find(m => m.probe === 0 && !m.public_port);
+  $("probe_cmd").textContent = probeCmd(need ? need.lan_port : 0);
 }
+
+function probeCmd(port){
+  const base = location.protocol + "//" + location.host;
+  return `curl -s ${base}/probe.py -o probe.py && python3 probe.py ${port || "端口"} --loop 30`;
+}
+async function copyText(t, btn){
+  let ok = true;
+  try { await navigator.clipboard.writeText(t); }
+  catch(e){
+    const ta = document.createElement("textarea");
+    ta.value = t; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.select();
+    try { document.execCommand("copy"); } catch(e2) { ok = false; }
+    ta.remove();
+  }
+  if(btn){ const old = btn.textContent; btn.textContent = ok ? "已复制" : "复制失败";
+           setTimeout(()=>btn.textContent = old, 1500); }
+  else if(!ok){ prompt("复制这条命令：", t); }
+}
+function copyProbe(btn){ copyText($("probe_cmd").textContent, btn); }
+function copyProbeFor(port, btn){ copyText(probeCmd(port), btn); }
 
 async function loadStun(){
   const rows = await (await fetch("/api/stun")).json();

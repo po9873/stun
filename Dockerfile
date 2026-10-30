@@ -20,6 +20,8 @@ RUN if [ -n "$PIP_INDEX_URL" ]; then \
     fi
 
 COPY app ./app
+# 探针客户端：单文件、只依赖标准库，由 WebUI 的 /probe.py 分发给内网机器
+COPY probe_client.py ./probe_client.py
 
 ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data \
