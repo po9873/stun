@@ -1,49 +1,13 @@
-# stun —— 自建 DNAT / STUN 管理器（单容器，macvlan 部署）
-#
-# 三种部署方式（Portainer CE 2.45.3），任选其一：
-#
-# A. 镜像方式（推荐，最终形态）
-#    1. 源码推到 GitHub，Actions 自动构建并推到 Docker Hub（po9873/stun:latest）
-#    2. Portainer → Stacks → Add stack → Web editor 粘贴本文件
-#    3. 在栈的 Environment variables 里把 STUN_IMAGE 设为 po9873/stun:latest
-#       （不设则用本文件默认的 po9873/stun:latest；本地自构建时改成 stun:local）
-#
-# B. 本地构建方式
-#    在宿主机上先构建镜像：
-#      docker build -t stun:local .
-#    然后把 STUN_IMAGE 改成 stun:local
-#
-# C. Git 仓库方式
-#    Portainer → Stacks → Add stack → Repository
-#      Repository URL: https://github.com/<你的用户名>/stun
-#      Compose path : docker-compose.yml
-#    并把 STUN_IMAGE 设为 Docker Hub 上的镜像（Portainer 不支持在栈内 build 远程镜像）
-#
-# 部署后：打开 WebUI →「设置」页填爱快地址 / 个人 API 令牌 / WAN 口名。
-#
-# ⚠ 说明：
-#   - 爱快连接信息不在 compose 里配置，改到 WebUI 设置页，存于 /data 卷，重建容器不丢。
-#   - 探测默认走 STUN over TCP（UDP 3478 在部分网络被封），扫描时自动 TCP→UDP 回退。
-#   - 复用宿主机上已存在的 macvlan 网络，不要新建（新建会抢网关报 Address already in use）。
-
 version: "3.8"
 
 services:
   stun:
-    # 改成 stun:local 可使用宿主机本地构建的镜像
-    image: ${STUN_IMAGE:-po9873/stun:latest}
+    image: stun:local
     container_name: stun
     environment:
-      # 爱快地址/令牌/WAN口名 一律在 WebUI「设置」页填写，存进 /data 的数据库，
-      # 不写在 compose 里。下面几项仅用于无人值守部署时预置（可留空）。
-      # - IKUAI_CLI_BASE_URL=https://192.168.6.254
-      # - IKUAI_CLI_TOKEN=
-      # - IKUAI_INTERFACE=adsl1
-      # - IKUAI_VERIFY_SSL=false
       - DATA_DIR=/data
       - WEB_HOST=0.0.0.0
       - WEB_PORT=80
-      # 容器默认 UTC，日志时间会比北京时间早 8 小时；设成上海时区与本地一致
       - TZ=Asia/Shanghai
       - POLL_INTERVAL=60
       - STUN_SCAN_INTERVAL=3600
@@ -54,10 +18,9 @@ services:
     networks:
       macvlan_net:
         ipv4_address: 192.168.6.104
-    mac_address: "02:42:C0:A8:06:68"   # 固定 MAC（十六进制即 192.168.6.104）
+    mac_address: "02:42:C0:A8:06:68"
     restart: unless-stopped
 
-# 指向宿主机上已存在的 macvlan 网络（本机实测为 bridge-host，父接口 ens18）
 networks:
   macvlan_net:
     external: true

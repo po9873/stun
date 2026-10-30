@@ -61,7 +61,7 @@
 <body>
 <header>
   <h1>stun</h1>
-  <span class="sub">DNAT / STUN 管理器 · 摆脱 Lucky · 多 macvlan 映射</span>
+  <span class="sub">DNAT / STUN 管理器</span>
 </header>
 <div class="wrap">
   <div id="alert" class="alert" style="display:none"></div>
@@ -93,20 +93,13 @@
         <div><label title="爱快 DNAT 规则里的外网端口，不是公网端口">爱快外网端口(可选)</label><input id="m_wan" type="number" placeholder="留空=与内网端口一致"/></div>
         <div><button class="btn primary" onclick="addMapping()">添加并建爱快规则</button></div>
       </div>
-      <p class="muted" style="margin:10px 0 0">
-        留空则爱快 DNAT 的「外网端口」与内网端口一致（默认，也是你现有 QB/TR 映射的写法）。
-        这是爱快那一侧的端口，<b>不是公网端口</b>：填了内网端口，CGNAT 还会把它再翻成另一个公网端口，
-        对外发布一律用表格里的「公网访问地址」，那个是 STUN 实测值。
-        添加后会立即在爱快创建 DNAT 规则并触发一次探测。
-      </p>
+      <p class="muted" style="margin:10px 0 0">外网端口留空则等于内网端口；对外发布用表格里的「公网访问地址」。</p>
     </div>
 
     <div class="card">
       <h3>批量录入（从 Lucky / 爱快粘贴）</h3>
       <p class="muted" style="margin:0 0 10px">
-        直接在 Lucky 后台或爱快「穿透规则」页选中复制，粘进来即可。
-        每行一条，支持 <code>名称 IP 端口 协议</code> 和 <code>IP:端口</code> 连写，
-        也认爱快那种 <code>UDP4 :39213 EasyTier-udp — — 192.168.6.42:27834</code> 的整行格式。
+        每行一条，支持 <code>名称 IP 端口 协议</code>，也认爱快穿透页的整行格式。
       </p>
       <textarea id="bulk_text" rows="5" placeholder="EasyTier-udp 192.168.6.42:27834 udp
 QB-RSS 192.168.6.13 46065 tcp+udp
@@ -120,11 +113,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         </label>
         <span id="bulk_msg" class="muted"></span>
       </div>
-      <p class="muted" style="margin:10px 0 0">
-        行里的公网端口（如 <code>:39213</code>）会被<b>丢弃</b>：CGNAT 下爱快 DNAT 的外网端口
-        必须等于内网端口，把公网端口填进去规则就匹配不上了。
-        公网访问地址会在录入后由 STUN 自己测出来。
-      </p>
     </div>
 
     <div class="card">
@@ -135,12 +123,7 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         <button class="btn" onclick="importAll()">一键全部接管</button>
         <span id="dis_msg" class="muted"></span>
       </div>
-      <p class="muted" style="margin:0 0 10px">
-        把路由上已有的 DNAT 规则直接登记进来，<b>不会改动路由上的任何设置</b>，
-        也不会删掉重建——沿用原有的规则 ID、内网地址和外网端口。
-        接管后可统一管理、纳入自动对账；
-        只有目标机就是容器自己时才会顺带测出公网访问地址。
-      </p>
+      <p class="muted" style="margin:0 0 10px">登记路由上已有的规则，不动路由，沿用原规则 ID 与端口。</p>
       <table>
         <thead><tr>
           <th style="width:30px"><input type="checkbox" id="dis_all" onchange="toggleAll(this.checked)"/></th>
@@ -167,60 +150,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         </tr></thead>
         <tbody id="map_body"></tbody>
       </table>
-      <p class="muted" style="margin:10px 0 0">
-        <b>内网端口永远不动</b>，「公网端口」是外部访问时真正要连的那个端口，
-        与「公网访问地址」里的端口必定一致，可以直接复制去用。
-        CGNAT 会把爱快外网口上的端口再翻成另一个公网端口，所以数字不同是正常的
-        （内网 25058 → 借 40000 → 公网 1719）。测不出来时这列显示「待测」。
-        若爱快上的外网端口与本地记录不一致，该行会打上「未同步」红标，
-        每 5 分钟自动推一次，也可点上方按钮立即对账。
-      </p>
-      <div style="border-left:3px solid var(--line);padding-left:12px;margin:12px 0 0">
-        <b>公网端口是怎么测出来的？</b>
-        <p class="muted" style="margin:6px 0 0">
-          容器从<b>目标机那个端口号</b>往外发一个包。爱快保留源端口，这个包出去时外部口
-          也是同一个端口号，于是和目标机自己的流量共用 CGNAT 上同一条映射 —— 问 STUN 服务器
-          拿到的就是外部真正能连进来的那个端口。<br/>
-          实测：<code>.104:24213 发包 → 公网 1638</code>，从公网连
-          <code>119.126.171.249:1638</code> 直接通到 <code>192.168.6.248:24213</code>。<br/>
-          每分钟发一次同时是<b>保活</b>：CGNAT 的映射空闲几分钟就会被回收、换一个新端口，
-          容器持续发包，端口就不容易漂。<br/>
-          <b>爱快上就是一条普普通通的端口映射</b>：内网地址、内部端口原样不动，
-          外网端口默认等于内部端口，不引入任何额外端口，流量也完全不经过容器。
-        </p>
-      </div>
-      <div style="border-left:3px solid var(--line);padding-left:12px;margin:12px 0 0">
-        <b>公网 IP 或公网端口变了，要自己改吗？</b>
-        <p class="muted" style="margin:6px 0 0">
-          <b>不用，全自动。</b>容器每分钟测一轮（并行测，几十条也是一分钟测完）：
-          测到新的公网 IP 就更新顶部地址并推一条「公网 IP 变化」通知；
-          测到公网端口变了就更新那一行并推「公网端口变化」通知。<br/>
-          而且<b>爱快那边完全不用动</b> —— 爱快的外网端口固定等于内部端口，
-          公网端口怎么漂都与爱快无关，所以不需要你触发任何操作。
-          真要改的只有对端：把新的公网访问地址发给对方，或者配好
-          <a href="#" onclick="goSet('notify_card');return false">通知/Webhook</a>让它自动推给你。
-        </p>
-      </div>
-    </div>
-
-    <div class="card">
-      <h3>全自动，什么都不用装</h3>
-      <p class="muted" style="margin:0 0 10px">
-        容器<b>从目标机那个端口号</b>往外发包 —— 爱快保留源端口，出去时外部口也是同一个号，
-        于是和目标机自己的流量共用 CGNAT 上同一条映射，测出来的就是外部真正能连进来的端口。
-        所以<b>每台内网机器都不用装任何东西</b>，容器自己就能把全部映射测出来。
-      </p>
-      <div style="border-left:3px solid var(--line);padding-left:12px">
-        <b>要守住三条，测出来的地址才真的能用：</b>
-        <ol class="muted" style="margin:6px 0 0;padding-left:18px">
-          <li><b>按协议挑服务器</b> —— CGNAT 上 TCP 与 UDP 是两套端口，
-              UDP 测出的端口 TCP 连不进来（实测 UDP 测出 1767，TCP 连 1767 完全不通）。</li>
-          <li><b>每条映射固定同一台服务器</b> —— 换一台就是新开一条流、拿到一个新公网端口，
-              旧的还没老化，外部连进来 CGNAT 不知道往哪送。</li>
-          <li><b>保持住 TCP 连接 + keepalive</b> —— CGNAT 是每条新连接一个新公网端口，
-              重连就换号（实测整块从 32xx 跳到 40xx）；同一条连接上每 20 秒问一次则纹丝不动。</li>
-        </ol>
-      </div>
     </div>
   </section>
 
@@ -233,10 +162,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         <button class="btn" onclick="refreshPool()">从 always-online-stun 更新清单</button>
         <span id="pool_msg" class="muted"></span>
       </div>
-      <p class="muted" style="margin:0 0 10px">
-        清单来源 <code>pradt2/always-online-stun</code>（官方每小时刷新），
-        容器每小时自动更新一次；国内访问不畅时自动沿用内置清单。
-      </p>
       <table>
         <thead><tr>
           <th>主机</th><th>端口</th><th>状态</th><th>延迟(ms)</th><th>传输</th><th>最后检查</th><th>操作</th>
@@ -261,9 +186,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
   <section id="tab-set" style="display:none">
     <div class="card">
       <h3>爱快连接设置</h3>
-      <p class="muted" style="margin:0 0 12px">
-        在这里填一次即可，不需要写进 docker-compose。修改后立即生效，无需重启容器。
-      </p>
       <div class="form">
         <div><label>爱快管理地址</label><input id="set_url" placeholder="https://192.168.6.254"/></div>
         <div><label>个人 API 令牌</label><input id="set_token" type="password" placeholder="留空则沿用已保存的令牌"/></div>
@@ -277,10 +199,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
             <option value="stun">STUN 实测值（仅当改端口的是爱快自己）</option>
           </select>
         </div>
-        <div class="muted" style="grid-column:1/-1">
-          判据：STUN 实测端口 ≠ 内网端口 → 是运营商 CGNAT 在改端口，必须用「端口保留」；
-          实测端口 = 内网端口 → 两种模式等价，保持默认即可。
-        </div>
       </div>
       <div class="form" style="margin-top:12px">
         <div style="grid-column:1/-1">
@@ -288,24 +206,10 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
           <input id="set_pool" placeholder="https://raw.githubusercontent.com/pradt2/always-online-stun/master/valid_hosts_tcp.txt"/>
         </div>
       </div>
-      <p class="muted" style="margin:10px 0 0">
-        可直接粘贴 GitHub 网页地址（<code>github.com/…/blob/master/valid_hosts_tcp.txt</code>），
-        程序会自动转成 raw 直链；国内不通时再自动退回 jsDelivr / 镜像。
-        留空则用内置的默认地址。
-      </p>
-      <p class="muted" style="margin:10px 0 0">
-        <b>STUN 实测值</b>：把 STUN 探到的公网端口写进爱快 DNAT 的「外网端口」。
-        适用于无公网/CGNAT —— 改端口的是运营商那一层，爱快直接用公网端口。<br/>
-        <b>端口保留</b>：外网端口等于内网端口，公网端口只在页面展示。
-        适用于改端口的是爱快本身的情况。
-      </p>
     </div>
 
     <div class="card" id="notify_card">
       <h3>变更通知（Webhook）</h3>
-      <p class="muted" style="margin:0 0 12px">
-        公网 IP 或公网端口一变就推送给你 —— 这就是 Lucky 里「STUN 穿透 + Webhook 推送」那套。
-      </p>
       <div class="form">
         <div><label>启用通知</label>
           <select id="nf_on"><option value="0">关</option><option value="1">开</option></select>
@@ -346,11 +250,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
           </div>
         </div>
       </div>
-      <p class="muted" style="margin:10px 0 0">
-        CGNAT 的公网端口会自己漂移（实测同一端口隔 75 秒就换一个），
-        所以「公网端口变化」必须带冷却，否则一条映射就能把手机刷爆。
-        默认同一映射 10 分钟内只推一次。
-      </p>
       <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <button class="btn primary" onclick="testNotify()">发送测试</button>
         <span id="nf_msg" class="muted"></span>
@@ -361,10 +260,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         <span id="set_msg" class="muted"></span>
       </div>
       <div id="set_state" class="muted" style="margin-top:10px"></div>
-      <p class="muted" style="margin:10px 0 0">
-        地址只需填到路由地址（如 <code>https://192.168.6.254</code>），
-        程序会自动补 <code>/api/v4.0</code>。
-      </p>
     </div>
   </section>
 
@@ -376,10 +271,6 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
         <button class="btn" onclick="loadLogs()">刷新</button>
         <button class="btn danger" onclick="clearLogs()">清空</button>
       </div>
-      <p class="muted" style="margin:0 0 10px">
-        记录 NAT 检测、STUN 扫描、端口探测、爱快规则增删等运行事件（保留最近 500 条）。
-        完整容器日志见 Portainer 容器页的 Logs。
-      </p>
       <pre id="log_body" class="logbox"></pre>
     </div>
   </section>
@@ -727,16 +618,6 @@ async function loadLogs(){
 async function clearLogs(){
   await fetch("/api/logs",{method:"DELETE"});
   loadLogs();
-}
-
-// 从别处点链接跳到设置页的某个卡片
-function goSet(cardId){
-  const t=[...document.querySelectorAll(".tab")].find(x=>x.dataset.tab==="set");
-  if(t) t.click();
-  setTimeout(()=>{
-    const el=document.getElementById(cardId);
-    if(el) el.scrollIntoView({behavior:"smooth",block:"center"});
-  },60);
 }
 
 async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); }
