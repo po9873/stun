@@ -5,16 +5,9 @@ services:
     image: stun:local
     container_name: stun
     environment:
-      - DATA_DIR=/data
-      - WEB_HOST=0.0.0.0
-      - WEB_PORT=80
       - TZ=Asia/Shanghai
-      - POLL_INTERVAL=60
-      - STUN_SCAN_INTERVAL=3600
-      - NAT_CHECK_INTERVAL=3600
-      - STUN_POOL_REFRESH_INTERVAL=3600
     volumes:
-      - stun_data:/data
+      - /mnt/sda1/stun:/data
     networks:
       macvlan_net:
         ipv4_address: 192.168.6.104
@@ -25,6 +18,3 @@ networks:
   macvlan_net:
     external: true
     name: bridge-host
-
-volumes:
-  stun_data:
