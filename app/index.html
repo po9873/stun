@@ -90,13 +90,13 @@
             <option value="any">any</option>
           </select>
         </div>
-        <div><label>外网端口(可选)</label><input id="m_wan" type="number" placeholder="留空=与内网端口一致"/></div>
+        <div><label title="爱快 DNAT 规则里的外网端口，不是公网端口">爱快外网端口(可选)</label><input id="m_wan" type="number" placeholder="留空=与内网端口一致"/></div>
         <div><button class="btn primary" onclick="addMapping()">添加并建爱快规则</button></div>
       </div>
       <p class="muted" style="margin:10px 0 0">
         留空则爱快 DNAT 的「外网端口」与内网端口一致（默认，也是你现有 QB/TR 映射的写法）。
-        入站流量经 CGNAT 还原后，到达爱快的就是内网端口，所以规则要按内网端口匹配。
-        对外发布用的地址看表格里的「公网访问地址」，那个是 STUN 实测值。
+        这是爱快那一侧的端口，<b>不是公网端口</b>：填了内网端口，CGNAT 还会把它再翻成另一个公网端口，
+        对外发布一律用表格里的「公网访问地址」，那个是 STUN 实测值。
         添加后会立即在爱快创建 DNAT 规则并触发一次探测。
       </p>
     </div>
@@ -161,24 +161,46 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
       <table>
         <thead><tr>
           <th>名称</th><th>内网 IP:端口</th><th>协议</th>
-          <th>外网端口(爱快)</th><th>公网访问地址</th>
+          <th title="外部访问时用的端口，就是公网访问地址里的那个端口">公网端口</th><th>公网访问地址</th>
           <th title="和爱快界面上的序号一致（灰色小字是路由内部 ID，删过规则会留空号）">#</th>
           <th>状态</th><th>操作</th>
         </tr></thead>
         <tbody id="map_body"></tbody>
       </table>
       <p class="muted" style="margin:10px 0 0">
-        「外网端口(爱快)」是对账时从路由上读回的真实值，不是本地想当然的值；
-        默认应与内网端口一致。若不一致，该行标红显示「未同步」，每 5 分钟自动推一次，
-        也可点上方按钮立即对账。
-        「公网访问地址」是 STUN 实测得出、发给别人访问用的地址。
-        容器<b>测不了别的机器</b>：拿目标机的端口去探测时，爱快发现那个外部端口已被目标机
-        占着，只能另给容器分一个，测出来的是容器自己那条（实测目标机 39213、容器测出 2048）。
-        这种装常驻探针就能解决。而软件自己 LISTEN 着的端口（QB 的 46065 之类），
-        探针也绑不上去（Address already in use）—— 这种点<b>开中转</b>：
-        容器借一个空闲端口一直发包，把 CGNAT 上那条映射问出来并保活，
-        爱快只改外网端口，<b>内部端口一点不动</b>，流量依旧直达目标机、来源 IP 也不丢。
+        <b>内网端口永远不动</b>，「公网端口」是外部访问时真正要连的那个端口，
+        与「公网访问地址」里的端口必定一致，可以直接复制去用。
+        CGNAT 会把爱快外网口上的端口再翻成另一个公网端口，所以数字不同是正常的
+        （内网 25058 → 借 40000 → 公网 1719）。测不出来时这列显示「待测」。
+        若爱快上的外网端口与本地记录不一致，该行会打上「未同步」红标，
+        每 5 分钟自动推一次，也可点上方按钮立即对账。
       </p>
+      <div style="border-left:3px solid var(--line);padding-left:12px;margin:12px 0 0">
+        <b>公网端口是怎么测出来的？</b>
+        <p class="muted" style="margin:6px 0 0">
+          容器从<b>目标机那个端口号</b>往外发一个包。爱快保留源端口，这个包出去时外部口
+          也是同一个端口号，于是和目标机自己的流量共用 CGNAT 上同一条映射 —— 问 STUN 服务器
+          拿到的就是外部真正能连进来的那个端口。<br/>
+          实测：<code>.104:24213 发包 → 公网 1638</code>，从公网连
+          <code>119.126.171.249:1638</code> 直接通到 <code>192.168.6.248:24213</code>。<br/>
+          每分钟发一次同时是<b>保活</b>：CGNAT 的映射空闲几分钟就会被回收、换一个新端口，
+          容器持续发包，端口就不容易漂。<br/>
+          <b>爱快上就是一条普普通通的端口映射</b>：内网地址、内部端口原样不动，
+          外网端口默认等于内部端口，不引入任何额外端口，流量也完全不经过容器。
+        </p>
+      </div>
+      <div style="border-left:3px solid var(--line);padding-left:12px;margin:12px 0 0">
+        <b>公网 IP 或公网端口变了，要自己改吗？</b>
+        <p class="muted" style="margin:6px 0 0">
+          <b>不用，全自动。</b>容器每分钟测一轮（并行测，几十条也是一分钟测完）：
+          测到新的公网 IP 就更新顶部地址并推一条「公网 IP 变化」通知；
+          测到公网端口变了就更新那一行并推「公网端口变化」通知。<br/>
+          而且<b>爱快那边完全不用动</b> —— 爱快的外网端口固定等于内部端口，
+          公网端口怎么漂都与爱快无关，所以不需要你触发任何操作。
+          真要改的只有对端：把新的公网访问地址发给对方，或者配好
+          <a href="#" onclick="goSet('notify_card');return false">通知/Webhook</a>让它自动推给你。
+        </p>
+      </div>
     </div>
 
     <div class="card">
@@ -287,10 +309,10 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
       </p>
     </div>
 
-    <div class="card">
+    <div class="card" id="notify_card">
       <h3>变更通知（Webhook）</h3>
       <p class="muted" style="margin:0 0 12px">
-        公网端口一变就推送给你 —— 这就是 Lucky 里「STUN 穿透 + Webhook 推送」那套。
+        公网 IP 或公网端口一变就推送给你 —— 这就是 Lucky 里「STUN 穿透 + Webhook 推送」那套。
       </p>
       <div class="form">
         <div><label>启用通知</label>
@@ -416,28 +438,26 @@ async function loadMappings(){
           : (noprobe
              ? `<span class="muted" title="容器测不准别的机器；在这台机自己身上跑一下探针就能测出来">待本机探针</span>`
              : "—"));
-    // 爱快上真实生效的外网端口（对账读回）；与本地不一致时标红提示
+    // 爱快上真实生效的外网端口（对账读回）；与本地不一致时在状态列打红标
     const live = m.rule_id ? (ROUTER[String(m.rule_id)] || null) : null;
     const want = String(m.wan_port || m.lan_port);
     const miss = (live !== null && String(live) !== want);
     if(miss) tr.className = (tr.className ? tr.className + " " : "") + "mismatch";
-    const cell = miss
-      ? `<td><b style="color:var(--danger,#c0392b)">${live}</b> <span class="muted">→ 应为 ${want}</span></td>`
-      : `<td>${fmt(m.wan_port)}</td>`;
+    // 公网端口就是公网访问地址里的那个端口，两者永远一致；测不出就留空
+    const cell = m.public_port
+      ? `<td><b>${m.public_port}</b>${m.public_exact?"":`<span class="sub-id" title="还没实测过，仅供参考">?</span>`}</td>`
+      : `<td><span class="muted">待测</span></td>`;
     tr.innerHTML = `
       <td>${m.name}</td>
-      <td>${m.lan_ip}:${m.lan_port}${m.relay?`<span class="sub-id" title="容器借这个端口一直发包把映射保活；外网流量由爱快直接转过来，不经容器">借 ${m.relay_port} 保活</span>`:""}</td>
+      <td>${m.lan_ip}:${m.lan_port}</td>
       <td><span class="badge">${m.proto}</span></td>
       ${cell}
       <td>${addr}</td>
       <td>${idx+1}${m.rule_id?`<span class="sub-id" title="爱快的内部规则 ID（删过规则会留空号）">#${m.rule_id}</span>`:""}</td>
-      <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?" <span class='badge' style='background:#c0392b;color:#fff'>未同步</span>":""}</td>
+      <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?` <span class='badge' style='background:#c0392b;color:#fff' title='爱快上是 ${live}，本地记录应为 ${want}'>未同步</span>`:""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
-        ${m.relay
-          ? `<button class="btn small" onclick="relayToggle(${m.id}, false, '${m.name}')">关中转</button>`
-          : `<button class="btn small primary" title="容器独占一个端口自己测，再转发给这台机" onclick="relayToggle(${m.id}, true, '${m.name}')">开中转</button>`}
-        ${(noprobe && !m.relay && !m.public_port)?`<button class="btn small" title="复制这台机的一键安装命令" onclick="copyInstall('${m.lan_ip}',this)">装探针</button>`:""}
+        ${(!m.public_port)?`<button class="btn small" title="复制这台机的一键安装命令" onclick="copyInstall('${m.lan_ip}',this)">装探针</button>`:""}
         <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
@@ -449,21 +469,6 @@ function installCmd(ip, kind){
   if(kind === "win")
     return `powershell -NoProfile -Command "iex (iwr -useb ${base}/agent/install.ps1)"`;
   return `curl -fsSL ${base}/agent/install.sh | sudo sh`;
-}
-
-async function relayToggle(id, on, name){
-  if(on && !confirm(
-    "给「" + name + "」开启借端口？\n\n"
-    + "容器会独占一个空闲端口（比如 40000），一直从它发包把 CGNAT 上那条映射保活，\n"
-    + "爱快这条规则只改外网端口 = 40000，内部端口和内部地址都不动。\n"
-    + "好处：公网端口自动测出来，流量仍然直达目标机，来源 IP 也不丢。\n\n确定开启？")) return;
-  try{
-    await fetch("/api/mappings/" + id + "/relay", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({on: on})
-    });
-  }catch(e){ alert("请求失败：" + e); }
-  refresh();
 }
 
 async function loadAgents(){
@@ -795,6 +800,16 @@ async function loadLogs(){
 async function clearLogs(){
   await fetch("/api/logs",{method:"DELETE"});
   loadLogs();
+}
+
+// 从别处点链接跳到设置页的某个卡片
+function goSet(cardId){
+  const t=[...document.querySelectorAll(".tab")].find(x=>x.dataset.tab==="set");
+  if(t) t.click();
+  setTimeout(()=>{
+    const el=document.getElementById(cardId);
+    if(el) el.scrollIntoView({behavior:"smooth",block:"center"});
+  },60);
 }
 
 async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); await loadAgents(); }

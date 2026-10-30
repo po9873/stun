@@ -100,6 +100,14 @@ def init():
                 value TEXT
             )"""
         )
+        # 借端口（relay）那一套已废弃：改用直接爱快映射 —— 容器从目标机那个端口号
+        # 发包测公网端口，爱快规则就是一条普通端口映射（外网端口 = 内部端口）。
+        # 老库里如果还留着 relay=1，启动时一律还原成普通映射，别让 40xxx 留在路由上。
+        try:
+            c.execute("UPDATE mappings SET relay=0, relay_port=NULL, "
+                      "wan_port=lan_port, wan_port_manual=0, probe=1 WHERE relay=1")
+        except Exception:
+            pass
         c.commit()
         c.close()
 
@@ -225,16 +233,20 @@ def delete_stun_server(id):
         c.close()
 
 
-def get_best_stun_server(nat_only=False):
+def get_best_stun_server(nat_only=False, transport=None):
     """返回延迟最低、状态可用的服务器。
 
     nat_only=True 时只返回具备 RFC5780 NAT 检测能力的节点。
+    transport='tcp'/'udp' 时只返回支持该协议的节点 —— CGNAT 上 TCP 与 UDP 是
+    两套独立的公网端口，拿 UDP 测出来的端口当 TCP 的公网端口，外面根本连不进来。
     list_stun_servers() 已按「延迟升序（NULL 最后）」排序。
     """
     for s in list_stun_servers():
         if s["status"] != "active":
             continue
         if nat_only and not s.get("nat_capable"):
+            continue
+        if transport and (s.get("transport") or "") != transport:
             continue
         return s
     return None

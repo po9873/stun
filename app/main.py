@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel
 
-from . import (config, db, ikuai_client, logbuf, notifier, poller, relay,
+from . import (config, db, ikuai_client, logbuf, notifier, poller,
                settings, state, stun_probe)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -253,44 +253,10 @@ def _push_rule(m):
     return False
 
 
-@app.post("/api/mappings/{mid}/relay")
-def api_toggle_relay(mid: int, body: dict):
-    """开/关容器中转。
-
-    打开：容器独占一个端口，爱快规则改指到容器，容器自己测公网端口并转发流量；
-    关闭：规则改回直连目标机（或只留容器自测，看你怎么用）。
-    """
-    m = db.get_mapping(mid)
-    if not m:
-        raise HTTPException(404, "映射不存在")
-    on = bool(body.get("on"))
-    if on == bool(m.get("relay")):
-        return db.get_mapping(mid)
-    if on:
-        port = int(m.get("relay_port") or 0) or relay.pick_port()
-        db.update_mapping(mid, relay=1, relay_port=port, wan_port=port, probe=0)
-        m = db.get_mapping(mid)
-        if _push_rule(m):
-            log.info(f"[{m['name']}] 已开启借端口：容器 {relay.container_ip()}:{port} 保活，"
-                     f"爱快把外网 {port} 直连 {m['lan_ip']}:{m['lan_port']}")
-        relay.attach(m)
-        threading.Thread(target=relay.probe,
-                         args=(port, db.get_best_stun_server()),
-                         daemon=True).start()
-    else:
-        # 关掉后外网端口回到内网端口（端口保留），内部端口始终没动过
-        db.update_mapping(mid, relay=0, wan_port=int(m["lan_port"]))
-        m = db.get_mapping(mid)
-        if _push_rule(m):
-            log.info(f"[{m['name']}] 已关闭中转，规则改回直连 "
-                     f"{m['lan_ip']}:{m['lan_port']}")
-        relay.sync_all()
-    return db.get_mapping(mid)
-
-
 @app.get("/api/relay/status")
 def api_relay_status():
-    return relay.status()
+    """借端口已废弃：改用直接爱快映射（容器从目标机那个端口发包）测公网端口。"""
+    return {"ip": "", "ports": [], "dests": {}, "deprecated": True}
 
 
 @app.post("/api/mappings")

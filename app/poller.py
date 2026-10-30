@@ -11,6 +11,7 @@
 import logging
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 from . import config, db, ikuai_client, notifier, stun_probe, state
 
@@ -18,6 +19,30 @@ log = logging.getLogger("stun.poller")
 
 _thread = None
 _stop = threading.Event()
+_last_ext_ip = None
+# 每条映射问公网端口的间隔（秒）。保持住的连接需要定期发问才不会被服务器掐断
+PROBE_INTERVAL = 20
+
+
+def _note_ext_ip(ext_ip):
+    """记下探测回报的公网 IP；换了就推一条通知。
+
+    运营商重拨换 IP 是常事，公网端口不变但 IP 变了，别人一样连不上，
+    所以 IP 变动也得当成正经事件通知出去。
+    """
+    global _last_ext_ip
+    if not ext_ip:
+        return
+    if _last_ext_ip is None:
+        _last_ext_ip = state.get().get("external_ip")
+    if _last_ext_ip and _last_ext_ip != ext_ip:
+        log.info(f"公网 IP 变化 {_last_ext_ip} -> {ext_ip}")
+        try:
+            notifier.external_ip_changed(_last_ext_ip, ext_ip)
+        except Exception:
+            pass
+    _last_ext_ip = ext_ip
+    state.set(external_ip=ext_ip)
 
 
 def start():
@@ -44,6 +69,7 @@ def _loop():
     stun_probe.scan_servers()
     _reconcile(client)
     last_reconcile = time.time()
+    last_probe = 0.0
     while not _stop.is_set():
         now = time.time()
         if now - last_reconcile >= config.RECONCILE_INTERVAL:
@@ -60,91 +86,69 @@ def _loop():
         if now - last_scan >= config.STUN_SCAN_INTERVAL:
             stun_probe.scan_servers()
             last_scan = now
-        _poll_mappings(client)
-        _stop.wait(config.POLL_INTERVAL)
+        # 每 30 秒问一次：既是重新测量，也是给保持住的连接发心跳 ——
+        # 空闲太久服务器会把连接掐掉，一断就得重连，重连公网端口就换了
+        if now - last_probe >= PROBE_INTERVAL:
+            _poll_mappings(client)
+            last_probe = now
+        _stop.wait(5)
 
 
-def _poll_relay(client):
-    """中转模式的映射：容器独占端口，自己测出来的公网端口就是这条映射的公网地址。
+def _poll_mappings(client):
+    """每轮问一遍所有映射的公网端口。
 
-    每轮测一次同时也是心跳 —— 这个端口一直在往外发，CGNAT 那条映射才不会被运营商收回去。
+    做法：容器绑到<b>目标机那个端口号</b>上往外发一个包。爱快保留源端口，
+    所以这个包出去时外部口也是同一个端口号，和目标机自己的流量共用 CGNAT 上
+    同一条映射 —— 测出来的公网端口就是外部真正能连进来的那个，实测可用。
+    每轮发一次同时是心跳：CGNAT 的映射空闲几分钟就会被回收并换新端口，
+    容器持续发包，端口就不容易漂。
     """
-    from . import relay
-    targets = [m for m in db.list_mappings()
-               if m.get("relay") and m.get("relay_port") and m["status"] == "active"]
+    targets = [m for m in db.list_mappings() if m["status"] == "active"]
     if not targets:
-        relay.sync_all()
         return
-    for m in targets:
-        relay.attach(m)
-    server = db.get_best_stun_server()
-    for m in targets:
-        ext_ip, ext_port = relay.probe(int(m["relay_port"]), server)
+
+    def _probe(m):
+        # 服务器由 probe_mapping_port 按映射的协议去挑（TCP 映射只用 TCP 服务器）
+        try:
+            return m, stun_probe.probe_mapping_port(
+                m["lan_ip"], m["lan_port"], proto=m["proto"])
+        except Exception as e:
+            log.debug(f"探测异常 [{m['name']}]: {e}")
+            return m, (None, None, False)
+
+    # 并行测：串行的话 11 条要好几分钟才轮一遍，心跳间隔太长映射会被回收
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        results = list(ex.map(_probe, targets))
+
+    for m, (ext_ip, ext_port, _exact) in results:
         if ext_port is None:
+            fc = (m["fail_count"] or 0) + 1
+            # 测不到只是拿不到公网地址，爱快那条普通映射照样能用，
+            # 所以绝不因为它就把规则删掉
+            db.update_mapping(m["id"], fail_count=fc)
             continue
         if ext_ip:
-            state.set(external_ip=ext_ip)
+            _note_ext_ip(ext_ip)
+        db.update_mapping(m["id"], fail_count=0)
         if m.get("public_port") == ext_port:
             continue
         old = m.get("public_port")
+        # 端口号是从目标机那个端口发出来的，外部连这个地址就能到目标机，值可用
         db.update_mapping(m["id"], public_port=ext_port, public_exact=1,
-                          fail_count=0, agent_seen=int(time.time()))
-        log.info(f"中转公网端口变化 [{m['name']}] {old} -> {ext_port}"
-                 f"（容器端口 {m['relay_port']}）")
+                          agent_seen=int(time.time()))
+        log.info(f"公网端口变化 [{m['name']}] {old} -> {ext_port}")
         try:
             notifier.public_port_changed(
                 m, old, ext_port, ext_ip or state.get()["external_ip"])
         except Exception:
             pass
-    relay.sync_all()
-
-
-def _poll_mappings(client):
-    _poll_relay(client)
-    for m in db.list_mappings():
-        if m["status"] != "active":
-            continue
-        # 走容器中转的：公网端口由容器那个独占端口测出来，别再拿目标机端口白测
-        if m.get("relay"):
-            continue
-        # probe=0：目标机不是容器自己，探测结果无意义，不做无谓的 STUN 握手
-        if not m.get("probe", 1):
-            continue
-        server = db.get_best_stun_server()
-        if not server:
-            # 池子全被判 down：立刻扫一遍自救，而不是干等下个小时
-            log.warning("无可用 STUN 服务器，立即重新扫描")
-            stun_probe.scan_servers()
-            server = db.get_best_stun_server()
-            if not server:
-                continue
-        ext_ip, ext_port, exact = stun_probe.probe_mapping_port(
-            m["lan_ip"], m["lan_port"], server
-        )
-        if ext_port is None:
-            fc = (m["fail_count"] or 0) + 1
-            if fc >= 5:
-                log.warning(f"映射[{m['id']} {m['name']}] 连续 5 次失败，挂起")
-                _suspend(client, m, reason="连续5次STUN失败")
-            else:
-                db.update_mapping(m["id"], fail_count=fc)
-            continue
-        # 探测成功
-        db.update_mapping(m["id"], fail_count=0)
-        if m.get("public_port") != ext_port:
-            log.info(f"公网端口变化 [{m['name']}] {m.get('public_port')} -> {ext_port}"
-                     f" ({'精确' if exact else '近似'})")
-            db.update_mapping(m["id"], public_port=ext_port)
-            # 公网端口变了才通知（这才是别人访问你需要的地址）
-            if exact:
-                notifier.public_port_changed(
-                    m, m.get("public_port"), ext_port, state.get()["external_ip"])
-        # 记录这次探测是不是真的绑到了目标内网 IP。跨 IP 探测（目标机不是容器自己）
-        # 时 CGNAT 给的公网端口可能不同，页面上要能区分，不能给出假精度。
-        if bool(exact) != bool(m.get("public_exact", 1)):
-            db.update_mapping(m["id"], public_exact=1 if exact else 0)
         # 每轮都对齐一次，这样切模式/重启后能自动纠正不一致
-        _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, exact)
+        _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, True)
+
+    # 删掉/挂起的映射，收回它保持住的那条连接
+    stun_probe.prune_conns(
+        {(m["lan_ip"], int(m["lan_port"]),
+          "udp" if m["proto"] == "udp" else "tcp") for m in targets})
 
 
 def _check_nat(client):
@@ -153,7 +157,11 @@ def _check_nat(client):
     # unknown/error 只是本次没测准，不该把已有映射全部挂掉。
     blocked = label in ("nat4", "blocked")
     state.set(nat_type=label, nat_blocked=blocked,
-              external_ip=ext_ip, last_nat_check=db.now())
+              last_nat_check=db.now())
+    if ext_ip:
+        _note_ext_ip(ext_ip)
+    else:
+        state.set(external_ip=state.get().get("external_ip"))
     log.info(f"NAT 检测: {label} blocked={blocked} ext_ip={ext_ip}")
     if blocked:
         for m in db.list_mappings():
@@ -251,21 +259,6 @@ def _reconcile(client):
         rid = int(m["rule_id"])
         if rid not in router:
             continue
-        # 中转：规则整条指向容器的独占端口，三个字段都得对得上
-        if m.get("relay"):
-            fields = client.rule_fields(m)
-            r = raw[rid]
-            diffs = {k: v for k, v in fields.items() if str(r.get(k)) != str(v)}
-            if diffs:
-                try:
-                    client.update_dnat(rid, diffs, fallback=fields)
-                    fixed += 1
-                    router[rid] = fields["wan_port"]
-                    log.info(f"对账修正 [{m['name']}] 中转规则已对齐：{diffs}")
-                except Exception as e:
-                    log.error(f"对账修正失败 [{m['name']}]: {e}")
-                    notifier.rule_failed(m["name"], f"对账修正失败：{e}")
-            continue
         manual = bool(m.get("wan_port_manual"))
         if stun_mode and not m.get("public_exact", 1):
             # 跨 IP 探测得到的公网端口不可信，stun 模式下也不拿它去改路由
@@ -325,14 +318,12 @@ def _resume(client, m):
     preserve 且非手填 → 外网端口 = 内网端口；手填 → 用填的值；stun 模式 → 用实测值。
     """
     from . import settings as _settings
-    # 中转的规则内容本身就已经指向容器，外网端口恒等于容器端口，不能再按常规改
     fields = client.rule_fields(m)
-    if not m.get("relay"):
-        if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
-                and m.get("public_exact", 1)):
-            fields["wan_port"] = str(int(m["public_port"]))
-        elif m.get("wan_port_manual") and m.get("wan_port"):
-            fields["wan_port"] = str(int(m["wan_port"]))
+    if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
+            and m.get("public_exact", 1)):
+        fields["wan_port"] = str(int(m["public_port"]))
+    elif m.get("wan_port_manual") and m.get("wan_port"):
+        fields["wan_port"] = str(int(m["wan_port"]))
     try:
         rid = client.create_dnat({
             "name": fields["tagname"], "lan_ip": fields["lan_addr"],
@@ -365,13 +356,8 @@ def _provision_probe(id):
     m = db.get_mapping(id)
     if not m or m["status"] != "active":
         return
-    if not m.get("probe", 1):
-        return
-    server = db.get_best_stun_server()
-    if not server:
-        return
     ext_ip, ext_port, exact = stun_probe.probe_mapping_port(
-        m["lan_ip"], m["lan_port"], server
+        m["lan_ip"], m["lan_port"], proto=m["proto"]
     )
     if ext_port is None:
         return

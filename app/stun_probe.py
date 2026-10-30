@@ -16,6 +16,7 @@ NAT 分类：
 import logging
 import os
 import socket
+import threading
 import time
 
 from . import config, db, rfc5389, settings
@@ -235,15 +236,35 @@ def _ip_is_local(ip):
             pass
 
 
-def _probe_port_once(host, port, lan_ip, lan_port, timeout):
-    """对单台服务器探测端口映射。返回 (ext_ip, ext_port, exact)。"""
+def _probe_port_once(host, port, lan_ip, lan_port, timeout, need="tcp"):
+    """对单台服务器探测端口映射。返回 (ext_ip, ext_port, exact)。
+
+    两个关键点：
+    1. 从<b>目标机那个端口号</b>发包：爱快保留源端口，容器的包出去时外部口也是
+       同一个端口号，于是和目标机自己的流量共用 CGNAT 上同一条映射，测出来的
+       公网端口就是外部真正能连进来的那个（实测 .104:24213 测到 4412，
+       从公网连 4412 直接通到 .248:24213）。
+    2. <b>严格按协议，绝不跨协议回退</b>：CGNAT 上 TCP 与 UDP 是两套独立的公网
+       端口，拿 UDP 测出来的端口当 TCP 的公网端口，外面根本连不进来
+       （实测 UDP 测出 1767，TCP 连 1767 完全不通）。
+    """
     exact = _ip_is_local(lan_ip)
     # 绑不到目标 IP 时，退化为 0.0.0.0:<同一端口> —— 端口号保留，这对
     # 端口映射结果是决定性的，源 IP 退而用容器自身。
     want = (lan_ip, int(lan_port)) if exact else ("0.0.0.0", int(lan_port))
     req, tid = rfc5389.build_binding()
 
-    # 先 TCP
+    if need == "udp":
+        try:
+            resp, _ms, _t = rfc5389.request_udp(
+                host, port, timeout=timeout, local_addr=want, req=req, tid=tid
+            )
+            if resp and resp.get("mapped"):
+                return resp["mapped"][0], resp["mapped"][1], exact
+        except Exception as e:
+            log.debug(f"UDP 探测 {lan_ip}:{lan_port} via {host} 失败: {e}")
+        return None, None, exact
+
     s = None
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -262,48 +283,154 @@ def _probe_port_once(host, port, lan_ip, lan_port, timeout):
                 s.close()
             except Exception:
                 pass
-
-    # 再 UDP
-    try:
-        resp, _ms, _t = rfc5389.request_udp(
-            host, port, timeout=timeout, local_addr=want, req=req, tid=tid
-        )
-        if resp and resp.get("mapped"):
-            return resp["mapped"][0], resp["mapped"][1], exact
-    except Exception as e:
-        log.debug(f"UDP 探测 {lan_ip}:{lan_port} via {host} 失败: {e}")
     return None, None, exact
 
 
-def probe_mapping_port(lan_ip, lan_port, server, timeout=None):
+# 每条映射固定用同一台服务器问。(内网IP, 端口, 协议) -> 上次问通的那台服务器。
+# 必须固定：CGNAT 是按「内网IP:端口 + 目标服务器」这条流来分配公网端口的，
+# 每轮换一台服务器就等于新开一条流、拿到一个新公网端口，上一条还没老化，
+# 于是外部连进来时 CGNAT 不知道该往哪条送 —— 实测端口每轮都变、连不通，
+# 而固定服务器那几条 15 分钟纹丝不动，从公网连回来 2/2 通。
+_sticky = {}
+
+# 每条映射保持住的那条 TCP 连接：(内网IP, 端口, 协议) -> {sock, server}。
+# 必须保持：CGNAT 是「每条新 TCP 连接一个新公网端口」，重连一次端口就换一次
+# （实测每轮重连 -> 公网端口从 32xx 整块跳到 40xx）；
+# 而同一条连接上反复发问，端口纹丝不动，从公网连回来也通。
+_conns = {}
+_conn_lock = threading.Lock()
+
+
+def _conn_take(key, want, candidates, timeout):
+    """取出这条映射保持住的连接；没有或被掐断了就新建一条。"""
+    with _conn_lock:
+        c = _conns.get(key)
+    if c:
+        return c["sock"], c["server"]
+    for sv in candidates:
+        s = None
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            rfc5389.bind_source(s, want)
+            s.settimeout(timeout)
+            s.connect((socket.gethostbyname(sv["host"]), int(sv["port"])))
+            # 开 TCP keepalive：STUN 服务器会掐掉空闲连接，一断就得重连，
+            # 重连 CGNAT 就给个新公网端口，页面上就会看到端口乱跳
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            for opt, val in (("TCP_KEEPIDLE", 20), ("TCP_KEEPINTVL", 10)):
+                if hasattr(socket, opt):
+                    try:
+                        s.setsockopt(socket.IPPROTO_TCP, getattr(socket, opt), val)
+                    except OSError:
+                        pass
+        except Exception as e:
+            if s is not None:
+                try:
+                    s.close()
+                except Exception:
+                    pass
+            continue
+        with _conn_lock:
+            _conns[key] = {"sock": s, "server": sv}
+        return s, sv
+    return None, None
+
+
+def _conn_drop(key):
+    with _conn_lock:
+        c = _conns.pop(key, None)
+    if c:
+        try:
+            c["sock"].close()
+        except Exception:
+            pass
+
+
+def prune_conns(alive_keys):
+    """删除/挂起的映射，它那条保持住的连接要一并收回。"""
+    with _conn_lock:
+        keys = [k for k in _conns if k not in alive_keys]
+    for k in keys:
+        _conn_drop(k)
+
+
+def probe_mapping_port(lan_ip, lan_port, server=None, timeout=None, proto=None):
     """探测某个内网站点端口映射出的公网端口。
 
-    会依次尝试若干台服务器（最快那台未必支持当前传输协议），
+    两个必须守住的点：
+    1. 只挑<b>支持对应协议</b>的服务器：TCP 的映射就必须用 TCP 服务器问，
+       UDP 的映射就必须用 UDP 服务器问，绝不跨协议凑合（UDP 测出的端口 TCP 连不进）。
+    2. 每条映射<b>固定同一台服务器</b>：见上面 _sticky 的说明。
+
     任一台成功即返回。返回 (external_ip, external_port, exact)：
       exact=True   目标 IP 在本机，精确绑定 (lan_ip, lan_port)，结果最可靠
       exact=False  目标 IP 不在本机（macvlan 容器内绑不到别的容器 IP），
-                   退化为绑定 0.0.0.0:<同一端口>，端口号一致
+                   退化为绑定 0.0.0.0:<同一端口>，端口号一致 —— 端口号一致就够，
+                   因为爱快保留源端口，外部那侧的端口号与目标机完全相同
     """
     timeout = timeout or config.STUN_TIMEOUT
-    candidates = []
-    if server:
-        candidates.append(server)
+    need = "udp" if proto == "udp" else "tcp"
+    key = (lan_ip, int(lan_port), need)
+
+    def _match(s):
+        return s and s.get("status") == "active" \
+            and (s.get("transport") or "") == need
+
+    def _same(a, b):
+        return a and b and a.get("host") == b.get("host") \
+            and int(a.get("port", 0)) == int(b.get("port", 0))
+
+    # 上次问通的那台优先，其次调用方指定的，都没有就取延迟最低的
+    prefer = _sticky.get(key)
+    if not _match(prefer):
+        prefer = server if _match(server) else db.get_best_stun_server(transport=need)
+
+    candidates = [prefer] if _match(prefer) else []
     for s in db.list_stun_servers():
-        if s["status"] != "active":
-            continue
-        key = (s["host"], int(s["port"]))
-        if server and key == (server.get("host"), int(server.get("port", 0))):
+        if not _match(s) or _same(s, prefer):
             continue
         candidates.append(s)
         if len(candidates) >= 3:
             break
+    if not candidates:
+        # 池子里没有这个协议的可用服务器，立刻扫一遍自救，而不是干等下一轮
+        log.warning(f"没有可用的 {need.upper()} STUN 服务器，立即重新扫描")
+        for s in db.list_stun_servers():
+            if _match(s):
+                candidates.append(s)
+            if len(candidates) >= 3:
+                break
 
-    for c in candidates:
-        ext_ip, ext_port, exact = _probe_port_once(
-            c["host"], int(c["port"]), lan_ip, lan_port, timeout
-        )
-        if ext_port is not None:
-            return ext_ip, ext_port, exact
+    if need == "udp":
+        # UDP 没有连接概念，绑同一个端口反复发就行，端口本来就不乱跳
+        for c in candidates:
+            ext_ip, ext_port, exact = _probe_port_once(
+                c["host"], int(c["port"]), lan_ip, lan_port, timeout, need
+            )
+            if ext_port is not None:
+                _sticky[key] = c
+                return ext_ip, ext_port, exact
+        return (None, None, False)
+
+    # TCP：尽量复用保持住的那条连接，只有它坏了才重建（重建会拿到新公网端口）
+    exact = _ip_is_local(lan_ip)
+    want = (lan_ip, int(lan_port)) if exact else ("0.0.0.0", int(lan_port))
+    for attempt in range(3):
+        sock, sv = _conn_take(key, want, candidates, timeout)
+        if sock is None:
+            break
+        try:
+            req, tid = rfc5389.build_binding()
+            sock.settimeout(timeout)
+            resp = rfc5389.exchange(sock, req, tid, timeout)
+            if resp.get("mapped"):
+                _sticky[key] = sv
+                return resp["mapped"][0], resp["mapped"][1], exact
+        except Exception as e:
+            log.debug(f"复用连接问 {lan_ip}:{lan_port} 失败({e})，重建")
+        # 服务器掐了空闲连接，或连接已断：丢掉重建一条
+        _conn_drop(key)
     return (None, None, False)
 
 

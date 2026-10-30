@@ -229,18 +229,11 @@ class IKuaiClient:
             return {}
 
     def rule_fields(self, m):
-        """这条映射在爱快上应该长什么样。对账就照这份内容去比对。
+        """这条映射在爱快上应该长什么样：一条普普通通的端口映射。
 
-        借端口的（relay=1）：内部地址与内部端口原样不动，只把外网端口换成容器
-        借走的那个端口 —— 外网进来的流量由爱快直接转给目标机，不经过容器。
+        内网地址、内部端口原样不动，外网端口默认就是内部端口 —— 跟你在爱快界面上
+        手工加的端口映射一模一样，不引入任何额外端口。
         """
-        if m.get("relay"):
-            p = int(m["relay_port"])
-            return {"tagname": m["name"], "lan_addr": m["lan_ip"],
-                    "lan_port": str(int(m["lan_port"])),
-                    "wan_port": str(p),
-                    "protocol": m.get("proto") or "tcp",
-                    "interface": self.interface}
         return {"tagname": m["name"], "lan_addr": m["lan_ip"],
                 "lan_port": str(int(m["lan_port"])),
                 "wan_port": str(int(m.get("wan_port") or m["lan_port"])),

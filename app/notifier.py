@@ -124,6 +124,15 @@ def public_port_changed(m, old_port, new_port, ext_ip):
                 dedup_key=f"port:{m['id']}")
 
 
+def external_ip_changed(old_ip, new_ip):
+    """公网 IP 变了：端口没变但地址整个换了，别人一样连不上，必须通知。"""
+    return send("port",
+                f"[stun] 公网 IP 变化",
+                f"{old_ip} → {new_ip}\n"
+                f"各条映射的公网访问地址已自动更新，爱快规则无需改动。",
+                dedup_key="extip")
+
+
 def mapping_created(m):
     return send("mapping",
                 f"[stun] 新增映射 · {m['name']}",
