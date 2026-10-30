@@ -97,7 +97,21 @@ TLS    = 自签证书，默认跳过校验
 
 > 注意：`/api/v4.0/network/dnat/rules` 加 `?limit=` 分页参数会 500，列表用不带参数的 GET。
 
-## 部署（Portainer CE @ 192.168.6.38:9000）
+## 部署
+
+### 容器名 / 栈名 / 镜像名统一为 `stun`
+
+| 位置 | 名称 |
+|---|---|
+| GitHub 仓库 | `stun` |
+| Docker Hub 镜像 | `po9873/stun:latest` |
+| Portainer 栈 | `stun` |
+| 容器名 | `stun` |
+
+> 早期版本叫过 `stum`，已全部改回 `stun`。老栈/老镜像/老卷直接删掉重建即可，
+> 数据库可用「导出 → 导入 /data/stun.db」的方式迁移（配置、令牌都跟着走）。
+
+### Portainer CE 部署步骤
 
 1. 把整个 `stun/` 目录压缩成 zip。
 2. Portainer → **Stacks → Add stack** → **Upload** 上传 zip。
@@ -119,9 +133,37 @@ TLS    = 自签证书，默认跳过校验
 | `Get https://registry-1.docker.io/v2/` | 容器内没镜像，尝试联网拉取 | 先用 Docker build API 在宿主机构建 `stun:local`，compose 用 `image:` 不用 `build:` |
 | `failed to allocate gateway` | 新建 macvlan 与已存在的抢网关 | 复用宿主机已有的 macvlan 网络（`external: true`） |
 | WebUI 显示 `blocked` | UDP 3478 被封 | 改用 TCP STUN |
+| `Cannot locate specified Dockerfile` | 构建上下文 tar 里源码套了一层目录 | tar 以项目目录为根打包（`tar -C 项目 -czf x.tar.gz .`） |
+| `COPY failed: file not found ... requirements.txt` | 同上，路径对不上 | 同上 |
 
 > macvlan 特性：容器与宿主机（192.168.6.38）之间**默认不互通**，但容器内可正常访问
 > iKuai（192.168.6.254）与公网 STUN 服务器；从局域网其他电脑访问 http://192.168.6.104 正常。
+
+## 发布到 GitHub + Docker Hub
+
+仓库里已带好 GitHub Actions（`.github/workflows/docker-publish.yml`）：
+推 `main`/`master` 或打 `v*` 标签时自动构建 **amd64 + arm64** 多架构镜像并推到 Docker Hub。
+
+只需在 GitHub 仓库的 **Settings → Secrets and variables → Actions** 里加两个 secret：
+
+| Secret | 内容 |
+|---|---|
+| `DOCKERHUB_USERNAME` | Docker Hub 用户名（本例 `po9873`） |
+| `DOCKERHUB_TOKEN` | Docker Hub 的 **Access Token**（不是登录密码，在 Account Settings → Security 里生成） |
+
+首次上线顺序：
+
+```bash
+# 1. GitHub 上先建一个名为 stun 的空仓库（不要勾 README）
+git remote add origin https://github.com/<你的用户名>/stun.git
+git push -u origin main
+
+# 2. 推 v1.0.0 标签，触发多架构构建
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+镜像推上去后，Portainer 里把栈的 `STUN_IMAGE` 改成 `po9873/stun:latest` 重新部署即可，
+compose 里默认就是这个值。
 
 ## 配置方式
 
