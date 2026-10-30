@@ -102,7 +102,11 @@ def init():
                          ("client_pass", "TEXT"),
                          ("client_port", "INTEGER"),   # 已下发到客户端的端口
                          # 非 QB/TR 的客户端：自己写一条命令改端口（{port} 是新公网端口）
-                         ("client_cmd", "TEXT")):
+                         ("client_cmd", "TEXT"),
+                         # 穿透稳定端口：开启穿透时分配，≥ config.MIN_PUNCH_PORT。
+                         # 它本身是这条映射的 V4 监听/通告端口与爱快内部端口；
+                         # 爱快保留源端口时它同时就是可达公网端口。关闭穿透则置空。
+                         ("punch_port", "INTEGER")):
             if col not in have_m:
                 c.execute(f"ALTER TABLE mappings ADD COLUMN {col} {ddl}")
 

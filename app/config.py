@@ -60,7 +60,14 @@ STUN_SCAN_INTERVAL = _int("STUN_SCAN_INTERVAL", 3600) # STUN 服务器扫描间�
 NAT_CHECK_INTERVAL = _int("NAT_CHECK_INTERVAL", 3600) # NAT 复检间隔（秒）
 RECONCILE_INTERVAL = _int("RECONCILE_INTERVAL", 300)  # 与爱快对账间隔（秒）
 DEFAULT_PROTO = _env("DEFAULT_PROTO", "tcp")          # 新增映射默认协议
-STUN_TIMEOUT = _int("STUN_TIMEOUT", 4)                # 单次 STUN 探测超时（秒）
+STUN_TIMEOUT = _int("STUN_TIMEOUT", 4)
+
+# 穿透端口最小值：低于该值的端口直接换成 ≥ 该值的端口。
+# 用户要求穿透（公网访问）端口必须从 20000 起步（例：爱快/ACL 对低端口不友好）。
+# 实现上：为每条开启穿透的映射分配一个 ≥ MIN_PUNCH_PORT 的稳定端口作为
+# 「打洞端口 S」，它本身就当作该映射的 V4 监听/通告端口与爱快内部端口；
+# 由于爱快保留源端口，S 同时就是可达的公网端口。
+MIN_PUNCH_PORT = _int("MIN_PUNCH_PORT", 20000)                # 单次 STUN 探测超时（秒）
 
 # ---- STUN 服务器池在线更新（pradt2/always-online-stun，官方建议直接硬编码该链接）----
 STUN_POOL_URL = _first(

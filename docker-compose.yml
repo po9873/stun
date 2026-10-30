@@ -3,6 +3,10 @@ version: "3.8"
 services:
   stun:
     image: stun:local
+    # 允许从本项目目录重建镜像（Dockerfile 在根目录）。
+    # 加上 build 后：主机 `docker compose build` 或 Portainer 以「Git 仓库」方式
+    # 部署/Update 时，都会用当前源码重新构建 stun:local，无需手工维护镜像。
+    build: .
     container_name: stun
     mac_address: 02:42:c0:a8:06:68
     environment:

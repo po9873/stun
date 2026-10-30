@@ -145,8 +145,10 @@ def _poll_mappings(client):
                 m, old, ext_port, ext_ip or state.get()["external_ip"])
         except Exception:
             pass
-        # 每轮都对齐一次，这样切模式/重启后能自动纠正不一致
-        _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, True)
+        # 每轮都对齐一次，这样切模式/重启后能自动纠正不一致。
+        # 穿透映射的 wan_port 必须等于客户端端口（打洞源端口），由 _sync_punch 负责，这里跳过
+        if not m.get("punch"):
+            _sync_wan_port(client, db.get_mapping(m["id"]), ext_port, True)
     for m in targets:
         # 穿透模式：公网端口变了（或还没下发过）就同步到爱快内部端口与客户端
         _sync_punch(client, db.get_mapping(m["id"]))
@@ -233,21 +235,28 @@ def _sync_wan_port(client, m, public_port, exact=True):
 
 
 def _sync_punch(client, m, force=False):
-    """穿透模式：把实测公网端口写进爱快「内部端口」，并下发成 BT 客户端的监听端口。
+    """穿透模式：只读校验 + 爱快保活，绝不写客户端端口。
 
-    爱快的外网端口保持 = 内网端口（打洞端口），容器一直从它发包维持 CGNAT 映射；
-    内部端口 + 客户端监听端口 = 公网端口，于是客户端对外通告的就是公网端口，
-    外部连 公网IP:公网端口 → CGNAT → 100.x:打洞端口 → 爱快 DNAT → 内网机:公网端口。
+    前提（CGNAT 保留源端口）：公网可达端口 = 客户端监听端口。客户端已监听 ≥20000，
+    本工具承诺「不改动客户端」，所以这里只做三件事：
+      1) 护栏：若客户端端口(lan_port) < MIN_PUNCH_PORT，记告警并跳过（不自动改客户端）。
+      2) 校验：读一次客户端实际监听端口，若 ≠ lan_port 仅告警、不改写（避免「偷偷改端口」）。
+      3) 爱快：确保 外网口=内网口=lan_port 的普通映射（P→P），CGNAT 打洞心跳从 lan_port 发出。
     """
     from . import client_ctl
     if not m or not m.get("punch"):
         return
-    want = int(m.get("public_port") or 0)
-    if not want:
+    P = int(m["lan_port"])
+    # 护栏：客户端端口必须 ≥ MIN_PUNCH_PORT，否则公网访问端口不满足约束。
+    # 按用户要求不自动改客户端去抬高它，只能告警并跳过本条穿透。
+    if P < config.MIN_PUNCH_PORT:
+        log.warning(
+            f"[{m['name']}] 穿透：客户端端口 {P} < {config.MIN_PUNCH_PORT}，"
+            f"不满足「公网访问端口≥{config.MIN_PUNCH_PORT}」；"
+            f"请在客户端把监听端口抬到 ≥{config.MIN_PUNCH_PORT} 后再开穿透"
+            f"（本工具不代改客户端）。")
         return
-    if not force and m.get("client_port") == want:
-        return
-    # 客户端没配好就先自动发现；发现不到才跳过（避免「开了穿透不生效」）
+    # 客户端没配好就先自动发现（仅用于拿到地址做只读校验，不写端口）
     if not (m.get("client_url") or m.get("client_cmd")):
         from . import discovery
         ok, _msg = discovery.discover_for_mapping(m)
@@ -255,65 +264,56 @@ def _sync_punch(client, m, force=False):
             m = db.get_mapping(m["id"])
             log.info(f"[{m['name']}] 周期自动发现客户端：{_msg}")
         else:
-            log.warning(f"[{m['name']}] 开了穿透但自动发现客户端失败：{_msg}")
-            return
-    lan = int(m["lan_port"])
-    # 顺序：先把客户端监听端口改成公网端口；成功后再改爱快内部端口。
-    # 客户端改不动（如 TR 缺账号）就不动爱快，避免「爱快改了客户端没改」的断流。
-    try:
-        if m.get("client_cmd"):
-            client_ctl.run_cmd(m, want)          # 通用：任何客户端都靠这条命令
-        else:
-            client_ctl.set_port(m, want)         # 内置适配：QB / TR
-    except Exception as e:
-        log.error(f"[{m['name']}] 穿透：下发客户端监听端口失败（未改动爱快）: {e}")
-        return
+            log.debug(f"[{m['name']}] 开了穿透但未发现客户端，跳过校验")
+    # 只读校验客户端实际监听端口；不匹配只告警，绝不改写
+    if m.get("client_url"):
+        try:
+            got = client_ctl.get_port(m)
+            if got is not None and int(got) != P:
+                log.warning(
+                    f"[{m['name']}] 穿透校验：客户端实际监听 {got} ≠ 映射端口 {P}，"
+                    f"对外通告可能不一致；请确认客户端监听端口 = {P}")
+        except Exception as e:
+            log.debug(f"[{m['name']}] 穿透：读取客户端端口失败（仅校验，不改写）: {e}")
+    # 爱快：确保 外网口=内网口=P 的普通映射（P→P 即穿透所需的转发形态）
     if m.get("rule_id"):
         fallback = {
             "lan_addr": m["lan_ip"],
-            "lan_port": str(lan),
+            "lan_port": str(P),
             "protocol": m["proto"],
             "interface": client.interface,
             "tagname": m["name"],
         }
         try:
-            client.update_dnat(m["rule_id"], {"lan_port": str(want)},
+            client.update_dnat(m["rule_id"],
+                               {"wan_port": str(P), "lan_port": str(P)},
                                fallback=fallback)
         except Exception as e:
-            log.error(f"[{m['name']}] 穿透：改爱快内部端口失败，回滚客户端: {e}")
-            # 客户端已经改成公网端口，但爱快没转发 → 回滚客户端，避免断流
-            try:
-                if m.get("client_cmd"):
-                    client_ctl.run_cmd(m, lan)
-                else:
-                    client_ctl.set_port(m, lan)
-            except Exception:
-                pass
+            log.error(f"[{m['name']}] 穿透：对齐爱快 P→P 失败: {e}")
             return
-    db.update_mapping(m["id"], client_port=want)
-    log.info(f"[{m['name']}] 穿透端口 {want} 已同步（爱快内部端口 + 客户端监听端口）")
+    db.update_mapping(m["id"], client_port=P)
+    log.info(f"[{m['name']}] 穿透已对齐（只读校验，未改客户端）："
+             f"客户端/V4/V6 监听 {P}，爱快 {P}→{P}，心跳从 {P} 保活 CGNAT")
 
 
 def restore_punch(client, m):
-    """关掉穿透：爱快内部端口与客户端监听端口都还原成内网端口。"""
-    from . import client_ctl
+    """关掉穿透：仅翻转标志、清空打洞端口。
+
+    穿透与普通映射在爱快侧都是 外网口=内网口=lan_port 的 P→P，且客户端端口从未被本工具改动，
+    所以关闭穿透不需要改爱快、也不需要改客户端。这里仍把爱快对齐成 P→P（幂等），
+    避免历史上遗留的非 P→P 配置。
+    """
+    from . import client_ctl  # noqa: F401  (保留导入，便于将来扩展)
     if not m:
         return
-    want = int(m["lan_port"])
+    P = int(m["lan_port"])
     if m.get("rule_id"):
         try:
-            client.update_dnat(m["rule_id"], {"lan_port": str(want)})
+            client.update_dnat(m["rule_id"],
+                               {"wan_port": str(P), "lan_port": str(P)})
         except Exception as e:
-            log.error(f"[{m['name']}] 还原爱快内部端口失败: {e}")
-    if m.get("client_url") or m.get("client_cmd"):
-        try:
-            if m.get("client_cmd"):
-                client_ctl.run_cmd(m, want)
-            else:
-                client_ctl.set_port(m, want)
-        except Exception as e:
-            log.error(f"[{m['name']}] 还原客户端端口失败: {e}")
-    db.update_mapping(m["id"], punch=0, client_port=want)
+            log.error(f"[{m['name']}] 还原爱快端口失败: {e}")
+    db.update_mapping(m["id"], punch=0, client_port=P, punch_port=None)
 
 
 def _reconcile(client):
@@ -366,48 +366,32 @@ def _reconcile(client):
         if m.get("wan_port") != int(want):
             db.update_mapping(m["id"], wan_port=int(want))
         # 穿透模式：外网端口仍是打洞端口，内部端口必须是实测公网端口
-        if m.get("punch") and m.get("public_port"):
-            want_lan = str(int(m["public_port"]))
-            r0 = raw[rid]
-            fallback0 = {
-                "lan_addr": (r0.get("lan_addr") or "").strip()
-                            or ikuai_client.int_to_ip(r0.get("lan_addr_int"))
-                            or m["lan_ip"],
-                "lan_port": want_lan,
-                "protocol": r0.get("protocol") or m["proto"],
-                "interface": r0.get("interface") or client.interface,
-                "tagname": r0.get("tagname") or m["name"],
-            }
-            if str(r0.get("lan_port")) != want_lan:
-                try:
-                    client.update_dnat(rid, {"lan_port": want_lan}, fallback=fallback0)
-                    log.info(f"对账修正 [{m['name']}] 爱快内部端口 {r0.get('lan_port')} -> {want_lan}")
-                except Exception as e:
-                    log.error(f"对账修正失败 [{m['name']}]: {e}")
-            # 客户端那边可能被改回去/重启过，对账时强制对齐一次
+        if m.get("punch"):
+            # 穿透：爱快必须是 外网口=内网口=lan_port 的 P→P 映射；_sync_punch 负责对齐。
+            # 这里不再用 want(=实测公网端口) 去覆盖 wan_port，避免破坏打洞源端口
             _sync_punch(client, m, force=True)
-
-        if router[rid] == want:
-            continue
-        r = raw[rid]
-        fallback = {
-            "lan_addr": (r.get("lan_addr") or "").strip()
-                        or ikuai_client.int_to_ip(r.get("lan_addr_int"))
-                        or m["lan_ip"],
-            "lan_port": str(int(r.get("lan_port") or m["lan_port"])),
-            "protocol": r.get("protocol") or m["proto"],
-            "interface": r.get("interface") or client.interface,
-            "tagname": r.get("tagname") or m["name"],
-        }
-        try:
-            client.update_dnat(rid, {"wan_port": want}, fallback=fallback)
-            fixed += 1
-            log.info(f"对账修正 [{m['name']}] 爱快外网端口 {router[rid]} -> {want}")
-            notifier.reconciled(m["name"], router[rid], want)
-            router[rid] = want
-        except Exception as e:
-            log.error(f"对账修正失败 [{m['name']}]: {e}")
-            notifier.rule_failed(m["name"], f"对账修正失败：{e}")
+        else:
+            if router[rid] == want:
+                continue
+            r = raw[rid]
+            fallback = {
+                "lan_addr": (r.get("lan_addr") or "").strip()
+                            or ikuai_client.int_to_ip(r.get("lan_addr_int"))
+                            or m["lan_ip"],
+                "lan_port": str(int(r.get("lan_port") or m["lan_port"])),
+                "protocol": r.get("protocol") or m["proto"],
+                "interface": r.get("interface") or client.interface,
+                "tagname": r.get("tagname") or m["name"],
+            }
+            try:
+                client.update_dnat(rid, {"wan_port": want}, fallback=fallback)
+                fixed += 1
+                log.info(f"对账修正 [{m['name']}] 爱快外网端口 {router[rid]} -> {want}")
+                notifier.reconciled(m["name"], router[rid], want)
+                router[rid] = want
+            except Exception as e:
+                log.error(f"对账修正失败 [{m['name']}]: {e}")
+                notifier.rule_failed(m["name"], f"对账修正失败：{e}")
     if fixed:
         log.info(f"对账完成，修正 {fixed} 条规则")
         state.set(router_wan_ports={str(k): v for k, v in router.items()})
@@ -431,7 +415,10 @@ def _resume(client, m):
     """
     from . import settings as _settings
     fields = client.rule_fields(m)
-    if (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
+    if m.get("punch"):
+        # 穿透：外网口=内网口=lan_port(P)，CGNAT 打洞心跳从 P 发出
+        fields["wan_port"] = str(int(m["lan_port"]))
+    elif (_settings.get("wan_port_mode") == "stun" and m.get("public_port")
             and m.get("public_exact", 1)):
         fields["wan_port"] = str(int(m["public_port"]))
     elif m.get("wan_port_manual") and m.get("wan_port"):
@@ -478,4 +465,6 @@ def _provision_probe(id):
                       public_exact=1 if exact else 0,
                       **({"stun_host": sv["host"], "stun_port": sv["port"]}
                          if sv else {}))
-    _sync_wan_port(ikuai_client.IKuaiClient(), db.get_mapping(id), ext_port, exact)
+    # 穿透映射的 wan_port 由 _sync_punch 控制（= 打洞端口），这里跳过
+    if not m.get("punch"):
+        _sync_wan_port(ikuai_client.IKuaiClient(), db.get_mapping(id), ext_port, exact)
