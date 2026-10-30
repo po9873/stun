@@ -204,31 +204,23 @@ TR-保种, 192.168.6.251, 24211, tcp+udp"
     </div>
 
     <div class="card">
-      <h3>自动上报：装一次，之后全自动</h3>
+      <h3>全自动，什么都不用装</h3>
       <p class="muted" style="margin:0 0 10px">
-        CGNAT 的公网端口是每条流单独分配的，容器替别的机器测只能测到容器自己那条
-        （实测目标机 39213、容器测出 2048），所以必须由那台机自己发一次包。
-        这个常驻探针就干这件事：装上后它自己拉清单、自己测、自己回报，
-        以后在页面上加端口它下一轮自动跟上，不用再碰那台机。
+        容器<b>从目标机那个端口号</b>往外发包 —— 爱快保留源端口，出去时外部口也是同一个号，
+        于是和目标机自己的流量共用 CGNAT 上同一条映射，测出来的就是外部真正能连进来的端口。
+        所以<b>每台内网机器都不用装任何东西</b>，容器自己就能把全部映射测出来。
       </p>
-      <table>
-        <thead><tr>
-          <th>目标机</th><th>端口</th><th>探针状态</th><th>操作</th>
-        </tr></thead>
-        <tbody id="agent_body"></tbody>
-      </table>
-      <div class="form" style="margin-top:12px">
-        <div><label>目标机 IP</label><input id="d_ip" placeholder="192.168.6.13"></div>
-        <div><label>用户名</label><input id="d_user" value="root"></div>
-        <div><label>密码</label><input id="d_pwd" type="password" placeholder="SSH 密码"></div>
-        <div><label>SSH 端口</label><input id="d_port" value="22"></div>
-        <div><button class="btn primary" onclick="deploy()">自动装上并启动</button></div>
+      <div style="border-left:3px solid var(--line);padding-left:12px">
+        <b>要守住三条，测出来的地址才真的能用：</b>
+        <ol class="muted" style="margin:6px 0 0;padding-left:18px">
+          <li><b>按协议挑服务器</b> —— CGNAT 上 TCP 与 UDP 是两套端口，
+              UDP 测出的端口 TCP 连不进来（实测 UDP 测出 1767，TCP 连 1767 完全不通）。</li>
+          <li><b>每条映射固定同一台服务器</b> —— 换一台就是新开一条流、拿到一个新公网端口，
+              旧的还没老化，外部连进来 CGNAT 不知道往哪送。</li>
+          <li><b>保持住 TCP 连接 + keepalive</b> —— CGNAT 是每条新连接一个新公网端口，
+              重连就换号（实测整块从 32xx 跳到 40xx）；同一条连接上每 20 秒问一次则纹丝不动。</li>
+        </ol>
       </div>
-      <p class="muted" style="margin:10px 0 0">
-        连不上 SSH 的机器（Windows / 群晖 / 没开 SSH），用每行右边的「复制命令」，
-        到那台机上粘贴跑一次就好 —— 同样是装完自动跑，只是这一下得手动。
-      </p>
-      <pre id="deploy_out" class="code-box" style="display:none;margin:10px 0 0"></pre>
     </div>
   </section>
 
@@ -428,16 +420,9 @@ async function loadMappings(){
     const tr = document.createElement("tr");
     if(m.status==="suspended") tr.className="suspended";
     const dot = m.status==="active"?"s-active":"s-suspended";
-    // 容器自己测不准别的机器（爱快会给容器另分外部端口），但目标机装了探针
-    // 后回报上来的值是权威的，这时照样显示出来
-    const noprobe = m.probe === 0;
     const addr = (EXT_IP && m.public_port)
       ? `${EXT_IP}:${m.public_port}`
-      : (m.public_port
-          ? `:${m.public_port}`
-          : (noprobe
-             ? `<span class="muted" title="容器测不准别的机器；在这台机自己身上跑一下探针就能测出来">待本机探针</span>`
-             : "—"));
+      : (m.public_port ? `:${m.public_port}` : "—");
     // 爱快上真实生效的外网端口（对账读回）；与本地不一致时在状态列打红标
     const live = m.rule_id ? (ROUTER[String(m.rule_id)] || null) : null;
     const want = String(m.wan_port || m.lan_port);
@@ -457,66 +442,10 @@ async function loadMappings(){
       <td><span class="status-dot ${dot}"></span>${m.status==="active"?"正常":"已挂起"}${miss?` <span class='badge' style='background:#c0392b;color:#fff' title='爱快上是 ${live}，本地记录应为 ${want}'>未同步</span>`:""}</td>
       <td><div class="row-actions">
         ${m.status==="suspended"?`<button class="btn small" onclick="resume(${m.id})">恢复</button>`:""}
-        ${(!m.public_port)?`<button class="btn small" title="复制这台机的一键安装命令" onclick="copyInstall('${m.lan_ip}',this)">装探针</button>`:""}
         <button class="btn small danger" onclick="del(${m.id},'${m.name}')">删除</button>
       </div></td>`;
     tb.appendChild(tr);
   });
-}
-
-function installCmd(ip, kind){
-  const base = location.protocol + "//" + location.host;
-  if(kind === "win")
-    return `powershell -NoProfile -Command "iex (iwr -useb ${base}/agent/install.ps1)"`;
-  return `curl -fsSL ${base}/agent/install.sh | sudo sh`;
-}
-
-async function loadAgents(){
-  let rows = [];
-  try { rows = await (await fetch("/api/agent/hosts")).json(); } catch(e){ return; }
-  const tb = $("agent_body"); tb.innerHTML="";
-  rows.forEach(h=>{
-    const tr = document.createElement("tr");
-    const dot = h.online ? "s-active" : "s-down";
-    const age = h.age === null ? "" : (h.age < 60 ? h.age + " 秒前" : Math.round(h.age/60) + " 分钟前");
-    tr.innerHTML = `
-      <td>${h.lan_ip}</td>
-      <td>${h.ports.join(", ")}</td>
-      <td><span class="status-dot ${dot}"></span>${h.online ? "在线" : "没装 / 离线"}
-          <span class="muted">${h.online ? "" : age}</span>
-          <span class="badge" style="margin-left:6px">${h.got}/${h.ports.length} 已测出</span></td>
-      <td><div class="row-actions">
-        <button class="btn small" onclick="copyInstall('${h.lan_ip}', this)">Linux 命令</button>
-        <button class="btn small" onclick="copyInstallWin('${h.lan_ip}', this)">Windows 命令</button>
-        <button class="btn small primary" onclick="fillDeploy('${h.lan_ip}')">自动装</button>
-      </div></td>`;
-    tb.appendChild(tr);
-  });
-}
-
-function fillDeploy(ip){
-  $("d_ip").value = ip;
-  if(!$("d_user").value.trim()) $("d_user").value = "root";
-  $("d_pwd").focus();
-}
-
-async function deploy(){
-  const ip = $("d_ip").value.trim();
-  if(!ip){ alert("先填目标机 IP"); return; }
-  const out = $("deploy_out");
-  out.style.display = "block";
-  out.textContent = "正在连接 " + ip + " 并自动安装…";
-  try{
-    const r = await (await fetch("/api/agent/deploy", {
-      method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({ip: ip, user: $("d_user").value.trim() || "root",
-                            password: $("d_pwd").value,
-                            port: parseInt($("d_port").value || "22")})
-    })).json();
-    out.textContent = (r.ok ? "✔ 装好了（" + r.kind + "）\n" : "✘ 没装成（" + (r.stage||"") + "）\n")
-                      + (r.output || "");
-  }catch(e){ out.textContent = "请求失败：" + e; }
-  loadAgents();
 }
 
 async function tidyIds(){
@@ -543,8 +472,6 @@ async function copyText(t, btn){
            setTimeout(()=>btn.textContent = old, 1500); }
   else if(!ok){ prompt("复制这条命令：", t); }
 }
-function copyInstall(ip, btn){ copyText(installCmd(ip, "sh"), btn); }
-function copyInstallWin(ip, btn){ copyText(installCmd(ip, "win"), btn); }
 
 async function loadStun(){
   const rows = await (await fetch("/api/stun")).json();
@@ -812,7 +739,7 @@ function goSet(cardId){
   },60);
 }
 
-async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); await loadAgents(); }
+async function refresh(){ await loadStatus(); await loadMappings(); await loadStun(); }
 setInterval(refresh, 15000);
 setInterval(()=>{ if($("tab-log").style.display!=="none") loadLogs(); }, 5000);
 
