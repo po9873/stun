@@ -7,3 +7,6 @@ __pycache__/
 venv/
 /data/
 .vscode/
+
+# 临时错误日志
+*.err

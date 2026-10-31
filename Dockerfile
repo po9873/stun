@@ -1,9 +1,10 @@
 FROM python:3.12-slim
 
-# 国内网络构建时可指定 pip 镜像，避免 PyPI 超时：
-#   docker build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple ...
-ARG PIP_INDEX_URL=""
-ARG PIP_TRUSTED_HOST=""
+# 国内网络构建默认走清华镜像，避免 PyPI / Debian 官方源超时（docker 主机在国内部署）。
+# 如需换源或走官方源，可覆盖 build-arg：
+#   docker build --build-arg PIP_INDEX_URL=https://pypi.org/simple ...
+ARG PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"
+ARG PIP_TRUSTED_HOST="pypi.tuna.tsinghua.edu.cn"
 
 WORKDIR /app
 
@@ -26,7 +27,7 @@ COPY probe_client.py ./probe_client.py
 COPY agent_client.py ./agent_client.py
 
 # 自动把 agent 装到目标机上要用到 ssh / sshpass
-ARG APT_MIRROR=""
+ARG APT_MIRROR="mirrors.tuna.tsinghua.edu.cn"
 RUN if [ -n "$APT_MIRROR" ]; then \
       sed -i "s|deb.debian.org|$APT_MIRROR|g;s|security.debian.org|$APT_MIRROR|g" \
           /etc/apt/sources.list.d/debian.sources; \
