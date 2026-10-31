@@ -237,25 +237,16 @@ def _sync_wan_port(client, m, public_port, exact=True):
 def _sync_punch(client, m, force=False):
     """穿透模式：只读校验 + 爱快保活，绝不写客户端端口。
 
-    前提（CGNAT 保留源端口）：公网可达端口 = 客户端监听端口。客户端已监听 ≥20000，
-    本工具承诺「不改动客户端」，所以这里只做三件事：
-      1) 护栏：若客户端端口(lan_port) < MIN_PUNCH_PORT，记告警并跳过（不自动改客户端）。
-      2) 校验：读一次客户端实际监听端口，若 ≠ lan_port 仅告警、不改写（避免「偷偷改端口」）。
-      3) 爱快：确保 外网口=内网口=lan_port 的普通映射（P→P），CGNAT 打洞心跳从 lan_port 发出。
+    前提（CGNAT 保留源端口）：公网可达端口 = 客户端监听端口。
+    本工具承诺「不改动客户端」，所以这里只做两件事：
+      1) 校验：读一次客户端实际监听端口，若 ≠ lan_port 仅告警、不改写（避免「偷偷改端口」）。
+      2) 爱快：确保 外网口=内网口=lan_port 的普通映射（P→P），CGNAT 打洞心跳从 lan_port 发出。
+    （任何 lan_port 值都正常穿透，无低端口护栏；端口值由用户在客户端与映射中自行把控。）
     """
     from . import client_ctl
     if not m or not m.get("punch"):
         return
     P = int(m["lan_port"])
-    # 护栏：客户端端口必须 ≥ MIN_PUNCH_PORT，否则公网访问端口不满足约束。
-    # 按用户要求不自动改客户端去抬高它，只能告警并跳过本条穿透。
-    if P < config.MIN_PUNCH_PORT:
-        log.warning(
-            f"[{m['name']}] 穿透：客户端端口 {P} < {config.MIN_PUNCH_PORT}，"
-            f"不满足「公网访问端口≥{config.MIN_PUNCH_PORT}」；"
-            f"请在客户端把监听端口抬到 ≥{config.MIN_PUNCH_PORT} 后再开穿透"
-            f"（本工具不代改客户端）。")
-        return
     # 客户端没配好就先自动发现（仅用于拿到地址做只读校验，不写端口）
     if not (m.get("client_url") or m.get("client_cmd")):
         from . import discovery
@@ -297,7 +288,7 @@ def _sync_punch(client, m, force=False):
 
 
 def restore_punch(client, m):
-    """关掉穿透：仅翻转标志、清空打洞端口。
+    """关掉穿透：仅翻转标志。
 
     穿透与普通映射在爱快侧都是 外网口=内网口=lan_port 的 P→P，且客户端端口从未被本工具改动，
     所以关闭穿透不需要改爱快、也不需要改客户端。这里仍把爱快对齐成 P→P（幂等），
@@ -313,7 +304,7 @@ def restore_punch(client, m):
                                {"wan_port": str(P), "lan_port": str(P)})
         except Exception as e:
             log.error(f"[{m['name']}] 还原爱快端口失败: {e}")
-    db.update_mapping(m["id"], punch=0, client_port=P, punch_port=None)
+    db.update_mapping(m["id"], punch=0, client_port=P)
 
 
 def _reconcile(client):
